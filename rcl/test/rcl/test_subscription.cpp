@@ -226,6 +226,9 @@ TEST_F(TestSubscriptionFixture, test_subscription_bad_init) {
       mocking_utils::patch_and_return("lib:rcl", rmw_create_subscription, nullptr);
     ret = rcl_subscription_init(&subscription, this->node_ptr, ts, topic, &subscription_options);
     EXPECT_EQ(RCL_RET_ERROR, ret);
+    // The cause must survive the cleanup of options that were never set.
+    EXPECT_EQ(nullptr, strstr(rcl_get_error_string().str, "invalid allocator")) <<
+      rcl_get_error_string().str;
     rcl_reset_error();
   }
   {

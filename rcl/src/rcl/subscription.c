@@ -158,10 +158,14 @@ fail:
       }
     }
 
-    ret = rcl_subscription_options_fini(&subscription->impl->options);
-    if (RCL_RET_OK != ret) {
-      RCUTILS_SAFE_FWRITE_TO_STDERR(rmw_get_error_string().str);
-      RCUTILS_SAFE_FWRITE_TO_STDERR("\n");
+    // Options are only set once rmw created the subscription; finishing zeroed ones would
+    // replace the error that brought us here.
+    if (subscription->impl->options.allocator.allocate) {
+      ret = rcl_subscription_options_fini(&subscription->impl->options);
+      if (RCL_RET_OK != ret) {
+        RCUTILS_SAFE_FWRITE_TO_STDERR(rmw_get_error_string().str);
+        RCUTILS_SAFE_FWRITE_TO_STDERR("\n");
+      }
     }
 
     allocator->deallocate(subscription->impl, allocator->state);
