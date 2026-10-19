@@ -25,12 +25,14 @@ extern "C"
 #include "rmw/rmw.h"
 
 #include "./context_impl.h"
+#include "./guard_condition_callback.h"
 
 struct rcl_guard_condition_impl_s
 {
   rmw_guard_condition_t * rmw_handle;
   bool allocated_rmw_guard_condition;
   rcl_guard_condition_options_t options;
+  rcl_guard_condition_callback_t * callback;
 };
 
 rcl_guard_condition_t
@@ -76,6 +78,12 @@ __rcl_guard_condition_init_from_rmw_impl(
     RCL_SET_ERROR_MSG("allocating memory failed");
     return RCL_RET_BAD_ALLOC;
   }
+  rcl_ret_t ret = rcl_guard_condition_callback_init(allocator, &guard_condition->impl->callback);
+  if (RCL_RET_OK != ret) {
+    allocator->deallocate(guard_condition->impl, allocator->state);
+    guard_condition->impl = NULL;
+    return ret;
+  }
   // Create the rmw guard condition.
   if (rmw_guard_condition) {
     // If given, just assign (cast away const).
@@ -86,6 +94,7 @@ __rcl_guard_condition_init_from_rmw_impl(
     guard_condition->impl->rmw_handle = rmw_create_guard_condition(&(context->impl->rmw_context));
     if (!guard_condition->impl->rmw_handle) {
       // Deallocate impl and exit.
+      rcl_guard_condition_callback_fini(guard_condition->impl->callback, allocator);
       allocator->deallocate(guard_condition->impl, allocator->state);
       guard_condition->impl = NULL;
       RCL_SET_ERROR_MSG(rmw_get_error_string().str);
@@ -134,6 +143,7 @@ rcl_guard_condition_fini(rcl_guard_condition_t * guard_condition)
         result = RCL_RET_ERROR;
       }
     }
+    rcl_guard_condition_callback_fini(guard_condition->impl->callback, &allocator);
     allocator.deallocate(guard_condition->impl, allocator.state);
     guard_condition->impl = NULL;
   }
@@ -161,6 +171,20 @@ rcl_trigger_guard_condition(rcl_guard_condition_t * guard_condition)
     RCL_SET_ERROR_MSG(rmw_get_error_string().str);
     return RCL_RET_ERROR;
   }
+  rcl_guard_condition_callback_trigger(guard_condition->impl->callback);
+  return RCL_RET_OK;
+}
+
+rcl_ret_t
+rcl_guard_condition_set_on_trigger_callback(
+  rcl_guard_condition_t * guard_condition,
+  rcl_event_callback_t callback,
+  const void * user_data)
+{
+  if (!rcl_guard_condition_get_options(guard_condition)) {
+    return RCL_RET_INVALID_ARGUMENT;
+  }
+  rcl_guard_condition_callback_set(guard_condition->impl->callback, callback, user_data);
   return RCL_RET_OK;
 }
 

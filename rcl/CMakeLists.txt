@@ -5,6 +5,7 @@ project(rcl)
 find_package(ament_cmake_ros REQUIRED)
 find_package(ament_cmake_gen_version_h REQUIRED)
 
+find_package(Threads REQUIRED)
 find_package(libyaml_vendor REQUIRED)
 find_package(rcl_interfaces REQUIRED)
 find_package(rcl_logging_interface REQUIRED)
@@ -49,6 +50,7 @@ set(${PROJECT_NAME}_sources
   src/rcl/expand_topic_name.c
   src/rcl/graph.c
   src/rcl/guard_condition.c
+  src/rcl/guard_condition_callback.cpp
   src/rcl/init.c
   src/rcl/init_options.c
   src/rcl/lexer.c
@@ -97,6 +99,7 @@ target_link_libraries(${PROJECT_NAME} PUBLIC
   ${type_description_interfaces_TARGETS}
 )
 target_link_libraries(${PROJECT_NAME} PRIVATE
+  Threads::Threads
   ${RCL_LOGGING_IMPL}::${RCL_LOGGING_IMPL}
   ${service_msgs_TARGETS}
   tracetools::tracetools
@@ -113,6 +116,9 @@ endif()
 # which is appropriate when building the dll but not consuming it.
 target_compile_definitions(${PROJECT_NAME} PRIVATE "RCL_BUILDING_DLL")
 rcl_set_symbol_visibility_hidden(${PROJECT_NAME} LANGUAGE "C")
+set_target_properties(${PROJECT_NAME} PROPERTIES
+  CXX_VISIBILITY_PRESET hidden
+  VISIBILITY_INLINES_HIDDEN YES)
 
 if(BUILD_TESTING AND NOT RCUTILS_DISABLE_FAULT_INJECTION)
   target_compile_definitions(${PROJECT_NAME} PUBLIC RCUTILS_ENABLE_FAULT_INJECTION)

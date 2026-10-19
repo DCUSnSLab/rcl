@@ -14,7 +14,13 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <future>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "rcl/rcl.h"
 #include "rcl/guard_condition.h"
@@ -240,4 +246,227 @@ TEST_F(TestGuardConditionFixture, test_rcl_guard_condition_bad_arg) {
   rcl_reset_error();
   EXPECT_EQ(RCL_RET_INVALID_ARGUMENT, rcl_trigger_guard_condition(&zero_guard_condition));
   rcl_reset_error();
+}
+
+class TestGuardConditionCallback : public TestGuardConditionFixture
+{
+protected:
+  void SetUp() override
+  {
+    TestGuardConditionFixture::SetUp();
+    auto options = rcl_get_zero_initialized_init_options();
+    ASSERT_EQ(RCL_RET_OK, rcl_init_options_init(&options, rcl_get_default_allocator()));
+    ASSERT_EQ(RCL_RET_OK, rcl_init(0, nullptr, &options, &context));
+    ASSERT_EQ(RCL_RET_OK, rcl_init_options_fini(&options));
+    ASSERT_EQ(RCL_RET_OK, rcl_guard_condition_init(
+        &guard, &context, rcl_guard_condition_get_default_options()));
+  }
+
+  void TearDown() override
+  {
+    EXPECT_EQ(RCL_RET_OK, rcl_guard_condition_fini(&guard));
+    EXPECT_EQ(RCL_RET_OK, rcl_shutdown(&context));
+    EXPECT_EQ(RCL_RET_OK, rcl_context_fini(&context));
+    TestGuardConditionFixture::TearDown();
+  }
+
+  rcl_context_t context = rcl_get_zero_initialized_context();
+  rcl_guard_condition_t guard = rcl_get_zero_initialized_guard_condition();
+};
+
+TEST_F(TestGuardConditionCallback, invalid_arguments)
+{
+  auto zero = rcl_get_zero_initialized_guard_condition();
+  EXPECT_EQ(RCL_RET_INVALID_ARGUMENT,
+    rcl_guard_condition_set_on_trigger_callback(nullptr, nullptr, nullptr));
+  rcl_reset_error();
+  EXPECT_EQ(RCL_RET_INVALID_ARGUMENT,
+    rcl_guard_condition_set_on_trigger_callback(&zero, nullptr, nullptr));
+  rcl_reset_error();
+}
+
+TEST_F(TestGuardConditionCallback, callback_state_allocation_failure)
+{
+  struct State
+  {
+    size_t allocations = 0;
+    size_t deallocations = 0;
+  } state;
+  auto options = rcl_guard_condition_get_default_options();
+  options.allocator.state = &state;
+  options.allocator.allocate = [](size_t size, void * data) -> void * {
+      auto & state = *static_cast<State *>(data);
+      if (++state.allocations == 2) {
+        return nullptr;
+      }
+      return std::malloc(size);
+    };
+  options.allocator.deallocate = [](void * ptr, void * data) {
+      ++static_cast<State *>(data)->deallocations;
+      std::free(ptr);
+    };
+  auto other = rcl_get_zero_initialized_guard_condition();
+  EXPECT_EQ(RCL_RET_BAD_ALLOC, rcl_guard_condition_init(&other, &context, options));
+  EXPECT_EQ(nullptr, other.impl);
+  EXPECT_EQ(2u, state.allocations);
+  EXPECT_EQ(1u, state.deallocations);
+  rcl_reset_error();
+}
+
+TEST_F(TestGuardConditionCallback, counts_replacement_and_clear)
+{
+  std::vector<size_t> counts;
+  auto callback = [](const void * data, size_t count) {
+      auto & counts = *static_cast<std::vector<size_t> *>(const_cast<void *>(data));
+      counts.push_back(count);
+    };
+  ASSERT_EQ(RCL_RET_OK, rcl_trigger_guard_condition(&guard));
+  ASSERT_EQ(RCL_RET_OK, rcl_trigger_guard_condition(&guard));
+  ASSERT_EQ(RCL_RET_OK, rcl_guard_condition_set_on_trigger_callback(&guard, callback, &counts));
+  EXPECT_EQ((std::vector<size_t>{2}), counts);
+  ASSERT_EQ(RCL_RET_OK, rcl_trigger_guard_condition(&guard));
+  EXPECT_EQ((std::vector<size_t>{2, 1}), counts);
+
+  std::vector<size_t> replacement;
+  ASSERT_EQ(RCL_RET_OK,
+    rcl_guard_condition_set_on_trigger_callback(&guard, callback, &replacement));
+  EXPECT_TRUE(replacement.empty());
+  ASSERT_EQ(RCL_RET_OK, rcl_trigger_guard_condition(&guard));
+  EXPECT_EQ((std::vector<size_t>{1}), replacement);
+  ASSERT_EQ(RCL_RET_OK, rcl_guard_condition_set_on_trigger_callback(&guard, nullptr, nullptr));
+  ASSERT_EQ(RCL_RET_OK, rcl_trigger_guard_condition(&guard));
+  ASSERT_EQ(RCL_RET_OK, rcl_trigger_guard_condition(&guard));
+  EXPECT_EQ((std::vector<size_t>{1}), replacement);
+  ASSERT_EQ(RCL_RET_OK, rcl_guard_condition_set_on_trigger_callback(&guard, callback, &counts));
+  EXPECT_EQ((std::vector<size_t>{2, 1, 2}), counts);
+
+  auto null_data_callback = [](const void * data, size_t count) {
+      EXPECT_EQ(nullptr, data);
+      EXPECT_EQ(1u, count);
+    };
+  ASSERT_EQ(RCL_RET_OK,
+    rcl_guard_condition_set_on_trigger_callback(&guard, null_data_callback, nullptr));
+  EXPECT_EQ(RCL_RET_OK, rcl_trigger_guard_condition(&guard));
+}
+
+TEST_F(TestGuardConditionCallback, rmw_triggers_are_not_reported_and_wait_set_still_wakes)
+{
+  size_t count = 0;
+  auto callback = [](const void * data, size_t count) {
+      *static_cast<size_t *>(const_cast<void *>(data)) += count;
+    };
+  ASSERT_EQ(RCL_RET_OK, rcl_guard_condition_set_on_trigger_callback(&guard, callback, &count));
+  auto wait_set = rcl_get_zero_initialized_wait_set();
+  ASSERT_EQ(RCL_RET_OK, rcl_wait_set_init(
+      &wait_set, 0, 1, 0, 0, 0, 0, &context, rcl_get_default_allocator()));
+  OSRF_TESTING_TOOLS_CPP_SCOPE_EXIT({EXPECT_EQ(RCL_RET_OK, rcl_wait_set_fini(&wait_set));});
+  ASSERT_EQ(RCL_RET_OK, rcl_wait_set_add_guard_condition(&wait_set, &guard, nullptr));
+  ASSERT_EQ(RMW_RET_OK, rmw_trigger_guard_condition(rcl_guard_condition_get_rmw_handle(&guard)));
+  EXPECT_EQ(0u, count);
+  ASSERT_EQ(RCL_RET_OK, rcl_wait(&wait_set, 1000000000));
+  ASSERT_EQ(RCL_RET_OK, rcl_trigger_guard_condition(&guard));
+  EXPECT_EQ(1u, count);
+  ASSERT_EQ(RCL_RET_OK, rcl_wait(&wait_set, 1000000000));
+  EXPECT_EQ(&guard, wait_set.guard_conditions[0]);
+}
+
+TEST_F(TestGuardConditionCallback, failed_trigger_is_not_reported)
+{
+  auto mock = mocking_utils::patch_and_return(
+    "lib:rcl", rmw_trigger_guard_condition, RMW_RET_ERROR);
+  EXPECT_EQ(RCL_RET_ERROR, rcl_trigger_guard_condition(&guard));
+  rcl_reset_error();
+  size_t count = 0;
+  auto callback = [](const void * data, size_t events) {
+      *static_cast<size_t *>(const_cast<void *>(data)) += events;
+    };
+  ASSERT_EQ(RCL_RET_OK, rcl_guard_condition_set_on_trigger_callback(&guard, callback, &count));
+  EXPECT_EQ(0u, count);
+}
+
+TEST_F(TestGuardConditionCallback, concurrent_trigger_registration_replacement_and_clear)
+{
+  std::atomic<size_t> first{0};
+  std::atomic<size_t> second{0};
+  std::atomic<size_t> errors{0};
+  std::atomic<bool> start{false};
+  auto callback = [](const void * data, size_t count) {
+      *static_cast<std::atomic<size_t> *>(const_cast<void *>(data)) += count;
+    };
+  std::vector<std::thread> threads;
+  for (size_t i = 0; i < 4; ++i) {
+    threads.emplace_back([&]() {
+        while (!start.load()) {std::this_thread::yield();}
+        for (size_t j = 0; j < 1000; ++j) {
+          if (RCL_RET_OK != rcl_trigger_guard_condition(&guard)) {++errors;}
+        }
+      });
+  }
+  threads.emplace_back([&]() {
+      start.store(true);
+      for (size_t i = 0; i < 1000; ++i) {
+        if (RCL_RET_OK != rcl_guard_condition_set_on_trigger_callback(&guard, callback, &first)) {
+          ++errors;
+        }
+        if (RCL_RET_OK != rcl_guard_condition_set_on_trigger_callback(&guard, callback, &second)) {
+          ++errors;
+        }
+        if (RCL_RET_OK != rcl_guard_condition_set_on_trigger_callback(&guard, nullptr, nullptr)) {
+          ++errors;
+        }
+      }
+    });
+  for (auto & thread : threads) {
+    thread.join();
+  }
+  ASSERT_EQ(RCL_RET_OK, rcl_guard_condition_set_on_trigger_callback(&guard, callback, &first));
+  EXPECT_EQ(0u, errors.load());
+  EXPECT_EQ(4000u, first.load() + second.load());
+}
+
+TEST_F(TestGuardConditionCallback, clear_waits_for_in_flight_callback)
+{
+  struct State
+  {
+    std::promise<void> entered;
+    std::shared_future<void> release;
+  };
+  std::promise<void> release;
+  State state{{}, release.get_future().share()};
+  auto entered = state.entered.get_future();
+  auto callback = [](const void * data, size_t) {
+      auto & state = *static_cast<State *>(const_cast<void *>(data));
+      state.entered.set_value();
+      state.release.wait();
+    };
+  ASSERT_EQ(RCL_RET_OK, rcl_guard_condition_set_on_trigger_callback(&guard, callback, &state));
+  auto trigger = std::async(
+    std::launch::async, [&]() {
+      return rcl_trigger_guard_condition(&guard);
+    });
+  entered.wait();
+  std::promise<void> clearing;
+  auto clearing_started = clearing.get_future();
+  auto clear = std::async(
+    std::launch::async, [&]() {
+      clearing.set_value();
+      return rcl_guard_condition_set_on_trigger_callback(&guard, nullptr, nullptr);
+    });
+  clearing_started.wait();
+  EXPECT_EQ(std::future_status::timeout, clear.wait_for(std::chrono::milliseconds(20)));
+  release.set_value();
+  EXPECT_EQ(RCL_RET_OK, trigger.get());
+  EXPECT_EQ(RCL_RET_OK, clear.get());
+}
+
+TEST_F(TestGuardConditionCallback, callback_can_clear_itself)
+{
+  ASSERT_EQ(RCL_RET_OK, rcl_trigger_guard_condition(&guard));
+  auto callback = [](const void * data, size_t count) {
+      auto guard = static_cast<rcl_guard_condition_t *>(const_cast<void *>(data));
+      EXPECT_EQ(1u, count);
+      EXPECT_EQ(RCL_RET_OK, rcl_guard_condition_set_on_trigger_callback(guard, nullptr, nullptr));
+    };
+  ASSERT_EQ(RCL_RET_OK, rcl_guard_condition_set_on_trigger_callback(&guard, callback, &guard));
+  EXPECT_EQ(RCL_RET_OK, rcl_trigger_guard_condition(&guard));
 }

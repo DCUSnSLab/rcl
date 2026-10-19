@@ -24,6 +24,7 @@ extern "C"
 
 #include "rcl/allocator.h"
 #include "rcl/context.h"
+#include "rcl/event_callback.h"
 #include "rcl/macros.h"
 #include "rcl/types.h"
 #include "rcl/visibility_control.h"
@@ -185,16 +186,17 @@ rcl_guard_condition_get_default_options(void);
  *   - guard condition is `NULL`
  *   - guard condition is invalid (never called init or called fini)
  *
- * A guard condition can be triggered from any thread.
+ * A guard condition can be triggered from any thread. After a successful rmw trigger,
+ * this calls the registered on-trigger callback synchronously, if any.
  *
  * <hr>
  * Attribute          | Adherence
  * ------------------ | -------------
  * Allocates Memory   | Yes
- * Thread-Safe        | No [1]
+ * Thread-Safe        | Yes [1]
  * Uses Atomics       | No
- * Lock-Free          | Yes
- * <i>[1] it can be called concurrently with itself, even on the same guard condition</i>
+ * Lock-Free          | No
+ * <i>[1] concurrent trigger and callback registration are supported; concurrent finalization is not</i>
  *
  * \param[in] guard_condition handle to the guard_condition to be triggered
  * \return #RCL_RET_OK if the guard condition was triggered, or
@@ -205,6 +207,48 @@ RCL_PUBLIC
 RCL_WARN_UNUSED
 rcl_ret_t
 rcl_trigger_guard_condition(rcl_guard_condition_t * guard_condition);
+
+/// Set the callback called by successful rcl_trigger_guard_condition() calls.
+/**
+ * The callback receives user_data and the number of triggers since the previous
+ * callback. Triggers before registration, or while the callback is NULL, are
+ * accumulated and delivered synchronously when a non-NULL callback is set.
+ * Setting NULL clears the callback without discarding accumulated triggers.
+ *
+ * The callback may run on any thread calling trigger or this setter. Calls are
+ * serialized per guard condition, including callback execution. A racing trigger
+ * is delivered exactly once to the callback active when it acquires the callback
+ * lock, or accumulated if none is set. Replacing or clearing waits for callbacks
+ * executing on other threads to finish, so the previous user_data can then be
+ * released. Callbacks must be short and must not throw exceptions. They may
+ * trigger or change the callback on this guard condition recursively, but must
+ * not wait for another thread to trigger it or change its callback.
+ * Initialization and finalization must not run concurrently with these calls.
+ *
+ * Triggers made directly inside rmw, including graph guard condition triggers,
+ * do not pass through rcl_trigger_guard_condition() and are not reported.
+ * This callback does not consume the guard condition's wait-set readiness.
+ *
+ * Attribute          | Adherence
+ * ------------------ | -------------
+ * Allocates Memory   | No
+ * Thread-Safe        | Yes
+ * Uses Atomics       | No
+ * Lock-Free          | No
+ *
+ * \param[inout] guard_condition initialized guard condition
+ * \param[in] callback callback to register, or NULL to clear
+ * \param[in] user_data argument passed to the callback, may be NULL
+ * \return #RCL_RET_OK on success, or
+ * \return #RCL_RET_INVALID_ARGUMENT for a NULL or invalid guard condition.
+ */
+RCL_PUBLIC
+RCL_WARN_UNUSED
+rcl_ret_t
+rcl_guard_condition_set_on_trigger_callback(
+  rcl_guard_condition_t * guard_condition,
+  rcl_event_callback_t callback,
+  const void * user_data);
 
 /// Return the guard condition options.
 /**
