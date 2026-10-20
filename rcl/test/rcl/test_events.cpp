@@ -125,7 +125,7 @@ public:
     ASSERT_EQ(ret, RCL_RET_OK) << rcl_get_error_string().str;
   }
 
-  void setup_publisher_subscriber_events(
+  rcl_ret_t setup_publisher_subscriber_events(
     const rcl_publisher_event_type_t & pub_event_type,
     const rcl_subscription_event_type_t & sub_event_type)
   {
@@ -134,22 +134,35 @@ public:
     // init publisher events
     publisher_event = rcl_get_zero_initialized_event();
     ret = rcl_publisher_event_init(&publisher_event, &publisher, pub_event_type);
-    ASSERT_EQ(ret, RCL_RET_OK) << rcl_get_error_string().str;
+    if (ret != RCL_RET_OK) {
+      return ret;
+    }
 
     // init subscription event
     subscription_event = rcl_get_zero_initialized_event();
     ret = rcl_subscription_event_init(&subscription_event, &subscription, sub_event_type);
-    ASSERT_EQ(ret, RCL_RET_OK) << rcl_get_error_string().str;
+    if (ret != RCL_RET_OK) {
+      rcl_ret_t fail_ret = rcl_event_fini(&publisher_event);
+      (void)fail_ret;
+      return ret;
+    }
+
+    return RCL_RET_OK;
   }
 
-  void setup_publisher_subscriber_and_events_and_assert_discovery(
+  rcl_ret_t setup_publisher_subscriber_and_events_and_assert_discovery(
     const rcl_publisher_event_type_t & pub_event_type,
     const rcl_subscription_event_type_t & sub_event_type)
   {
-    setup_publisher_subscriber(default_qos_profile, default_qos_profile);
-    setup_publisher_subscriber_events(pub_event_type, sub_event_type);
-
     rcl_ret_t ret;
+
+    setup_publisher_subscriber(default_qos_profile, default_qos_profile);
+    ret = setup_publisher_subscriber_events(pub_event_type, sub_event_type);
+    if (ret != RCL_RET_OK) {
+      tear_down_publisher_subscriber();
+      return ret;
+    }
+
     // wait for discovery, time out after 10s
     static const size_t max_iterations = 1000;
     static const auto wait_period = 10ms;
@@ -158,16 +171,30 @@ public:
       size_t subscription_count = 0;
       size_t publisher_count = 0;
       ret = rcl_subscription_get_publisher_count(&subscription, &publisher_count);
-      EXPECT_OK(ret);
+      if (ret != RCL_RET_OK) {
+        tear_down_publisher_subscriber_events();
+        tear_down_publisher_subscriber();
+        return ret;
+      }
       ret = rcl_publisher_get_subscription_count(&publisher, &subscription_count);
-      EXPECT_OK(ret);
+      if (ret != RCL_RET_OK) {
+        tear_down_publisher_subscriber_events();
+        tear_down_publisher_subscriber();
+        return ret;
+      }
       if (subscription_count && publisher_count) {
         subscribe_success = true;
         break;
       }
       std::this_thread::sleep_for(wait_period);
     }
-    ASSERT_TRUE(subscribe_success) << "Publisher/Subscription discovery timed out";
+    if (!subscribe_success) {
+      tear_down_publisher_subscriber_events();
+      tear_down_publisher_subscriber();
+      return RCL_RET_TIMEOUT;
+    }
+
+    return RCL_RET_OK;
   }
 
   void tear_down_publisher_subscriber()
@@ -376,10 +403,14 @@ conditional_wait_for_msgs_and_events(
  */
 TEST_F(TestEventFixture, test_pubsub_no_deadline_missed)
 {
-  setup_publisher_subscriber_and_events_and_assert_discovery(
+  rcl_ret_t ret = setup_publisher_subscriber_and_events_and_assert_discovery(
     RCL_PUBLISHER_OFFERED_DEADLINE_MISSED,
     RCL_SUBSCRIPTION_REQUESTED_DEADLINE_MISSED);
-  rcl_ret_t ret;
+  if (ret == RCL_RET_UNSUPPORTED) {
+    rcl_reset_error();
+    GTEST_SKIP();
+  }
+  ASSERT_EQ(ret, RCL_RET_OK) << rcl_get_error_string().str;
 
   // publish message to topic
   const char * test_string = "testing";
@@ -443,10 +474,14 @@ TEST_F(TestEventFixture, test_pubsub_no_deadline_missed)
  */
 TEST_F(TestEventFixture, test_pubsub_deadline_missed)
 {
-  setup_publisher_subscriber_and_events_and_assert_discovery(
+  rcl_ret_t ret = setup_publisher_subscriber_and_events_and_assert_discovery(
     RCL_PUBLISHER_OFFERED_DEADLINE_MISSED,
     RCL_SUBSCRIPTION_REQUESTED_DEADLINE_MISSED);
-  rcl_ret_t ret;
+  if (ret == RCL_RET_UNSUPPORTED) {
+    rcl_reset_error();
+    GTEST_SKIP();
+  }
+  ASSERT_EQ(ret, RCL_RET_OK) << rcl_get_error_string().str;
 
   // publish message to topic
   const char * test_string = "testing";
@@ -518,10 +553,14 @@ TEST_F(TestEventFixture, test_pubsub_deadline_missed)
  */
 TEST_F(TestEventFixture, test_pubsub_liveliness_kill_pub)
 {
-  setup_publisher_subscriber_and_events_and_assert_discovery(
+  rcl_ret_t ret = setup_publisher_subscriber_and_events_and_assert_discovery(
     RCL_PUBLISHER_LIVELINESS_LOST,
     RCL_SUBSCRIPTION_LIVELINESS_CHANGED);
-  rcl_ret_t ret;
+  if (ret == RCL_RET_UNSUPPORTED) {
+    rcl_reset_error();
+    GTEST_SKIP();
+  }
+  ASSERT_EQ(ret, RCL_RET_OK) << rcl_get_error_string().str;
 
   // publish message to topic
   const char * test_string = "testing";
@@ -603,10 +642,20 @@ TEST_P(TestEventFixture, test_pubsub_incompatible_qos)
   const auto & subscription_qos_profile = input.subscription_qos_profile;
   const auto & error_msg = input.error_msg;
 
+  rmw_qos_compatibility_type_t compat;
+  rmw_ret_t rmw_ret = rmw_qos_profile_check_compatible(
+    publisher_qos_profile, subscription_qos_profile, &compat, nullptr, 0);
+  ASSERT_EQ(rmw_ret, RMW_RET_OK);
+  if (compat == RMW_QOS_COMPATIBILITY_OK) {
+    // This middleware lets the pair communicate, so no incompatible QoS event is raised.
+    GTEST_SKIP();
+  }
+
   setup_publisher_subscriber(publisher_qos_profile, subscription_qos_profile);
-  setup_publisher_subscriber_events(
-    RCL_PUBLISHER_OFFERED_INCOMPATIBLE_QOS,
-    RCL_SUBSCRIPTION_REQUESTED_INCOMPATIBLE_QOS);
+  ASSERT_EQ(
+    RCL_RET_OK, setup_publisher_subscriber_events(
+      RCL_PUBLISHER_OFFERED_INCOMPATIBLE_QOS,
+      RCL_SUBSCRIPTION_REQUESTED_INCOMPATIBLE_QOS)) << rcl_get_error_string().str;
 
   WaitConditionPredicate events_ready = [](
     const bool & /*msg_persist_ready*/,
@@ -707,6 +756,11 @@ TEST_F(TestEventFixture, test_event_is_valid)
 
   rcl_ret_t ret = rcl_publisher_event_init(
     &publisher_event_test, &publisher, RCL_PUBLISHER_OFFERED_DEADLINE_MISSED);
+  if (ret == RCL_RET_UNSUPPORTED) {
+    rcl_reset_error();
+    tear_down_publisher_subscriber();
+    GTEST_SKIP();
+  }
   ASSERT_EQ(ret, RCL_RET_OK) << rcl_get_error_string().str;
   EXPECT_TRUE(rcl_event_is_valid(&publisher_event_test));
 

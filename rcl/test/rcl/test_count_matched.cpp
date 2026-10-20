@@ -230,8 +230,17 @@ TEST_F(TestCountFixture, test_count_matched_functions_mismatched_qos) {
   ASSERT_EQ(RCL_RET_OK, ret) << rcl_get_error_string().str;
   rcl_reset_error();
 
-  // Expect that no publishers or subscribers should be matched due to qos.
-  check_state(wait_set_ptr, &pub, &sub, graph_guard_condition, 0, 0, 9);
+  rmw_qos_compatibility_type_t compat;
+  rmw_ret_t rmw_ret =
+    rmw_qos_profile_check_compatible(pub_ops.qos, sub_ops.qos, &compat, nullptr, 0);
+  ASSERT_EQ(rmw_ret, RMW_RET_OK);
+
+  if (compat == RMW_QOS_COMPATIBILITY_OK) {
+    check_state(wait_set_ptr, &pub, &sub, graph_guard_condition, 1, 1, 9);
+  } else {
+    // Expect that no publishers or subscribers should be matched due to qos.
+    check_state(wait_set_ptr, &pub, &sub, graph_guard_condition, 0, 0, 9);
+  }
 
   rcl_subscription_t sub2 = rcl_get_zero_initialized_subscription();
   rcl_subscription_options_t sub2_ops = rcl_subscription_get_default_options();
@@ -239,9 +248,14 @@ TEST_F(TestCountFixture, test_count_matched_functions_mismatched_qos) {
   EXPECT_EQ(RCL_RET_OK, ret) << rcl_get_error_string().str;
   rcl_reset_error();
 
-  // Even multiple subscribers should not match
-  check_state(wait_set_ptr, &pub, &sub, graph_guard_condition, 0, 0, 9);
-  check_state(wait_set_ptr, &pub, &sub2, graph_guard_condition, 0, 0, 9);
+  if (compat == RMW_QOS_COMPATIBILITY_OK) {
+    check_state(wait_set_ptr, &pub, &sub, graph_guard_condition, 2, 1, 9);
+    check_state(wait_set_ptr, &pub, &sub2, graph_guard_condition, 2, 1, 9);
+  } else {
+    // Even multiple subscribers should not match
+    check_state(wait_set_ptr, &pub, &sub, graph_guard_condition, 0, 0, 9);
+    check_state(wait_set_ptr, &pub, &sub2, graph_guard_condition, 0, 0, 9);
+  }
 
   ret = rcl_subscription_fini(&sub, this->node_ptr);
   EXPECT_EQ(RCL_RET_OK, ret) << rcl_get_error_string().str;
