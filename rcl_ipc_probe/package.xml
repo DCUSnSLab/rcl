@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>rcl_ipc_probe</name>
+  <version>0.0.1</version>
+  <description>Experimental owned C message delivery probe.</description>
+  <maintainer email="nevlife000720@gmail.com">nevlife</maintainer>
+  <license>Apache-2.0</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <depend>rcl</depend>
+  <depend>rcl_executor</depend>
+  <depend>sensor_msgs</depend>
+  <test_depend>ament_cmake_gtest</test_depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>

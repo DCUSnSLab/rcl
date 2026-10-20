@@ -99,6 +99,7 @@ rcl_subscription_init(
     1, sizeof(rcl_subscription_impl_t), allocator->state);
   RCL_CHECK_FOR_NULL_WITH_MSG(
     subscription->impl, "allocating memory failed", ret = RCL_RET_BAD_ALLOC; goto cleanup);
+  subscription->impl->context = node->context;
   // Fill out the implemenation struct.
   // rmw_handle
   // TODO(wjwwood): pass allocator once supported in rmw api.

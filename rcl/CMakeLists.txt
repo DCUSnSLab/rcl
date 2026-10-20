@@ -51,6 +51,7 @@ set(${PROJECT_NAME}_sources
   src/rcl/graph.c
   src/rcl/guard_condition.c
   src/rcl/guard_condition_callback.cpp
+  src/rcl/ipc_prototype.cpp
   src/rcl/init.c
   src/rcl/init_options.c
   src/rcl/lexer.c
