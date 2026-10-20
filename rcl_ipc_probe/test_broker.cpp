@@ -21,12 +21,70 @@
 #include "sensor_msgs/msg/image.h"
 #include "sensor_msgs/msg/image.hpp"
 #include "sensor_msgs/msg/camera_info.h"
+#include "test_msgs/message_fixtures.hpp"
+#include "test_msgs/msg/arrays.h"
+#include "test_msgs/msg/bounded_sequences.h"
+#include "test_msgs/msg/multi_nested.h"
+#include "test_msgs/msg/strings.h"
 #include "test_msgs/msg/unbounded_sequences.h"
 #include "test_msgs/msg/unbounded_sequences.hpp"
+#include "test_msgs/msg/w_strings.h"
+#include "rmw/serialized_message.h"
+#include "rmw/rmw.h"
 #include "rosidl_runtime_c/string_functions.h"
 
 namespace
 {
+// Padding bytes are unspecified in CDR, so the C message is compared after a C++ round trip.
+template<typename T>
+T through_cdr(const void * message, const rosidl_message_type_support_t * support)
+{
+  auto serialized = rmw_get_zero_initialized_serialized_message();
+  auto allocator = rcutils_get_default_allocator();
+  EXPECT_EQ(0, rmw_serialized_message_init(&serialized, 0, &allocator));
+  EXPECT_EQ(0, rmw_serialize(message, support, &serialized));
+  T result;
+  EXPECT_EQ(0, rmw_deserialize(&serialized,
+    rosidl_typesupport_cpp::get_message_type_support_handle<T>(), &result));
+  EXPECT_EQ(0, rmw_serialized_message_fini(&serialized));
+  return result;
+}
+template<typename T>
+void convert_both_ways(
+  rcl_node_t * node, const rosidl_message_type_support_t * c_support,
+  const std::vector<std::shared_ptr<T>> & messages)
+{
+  auto cpp_support = rosidl_typesupport_cpp::get_message_type_support_handle<T>();
+  auto options = rcl_publisher_get_default_options();
+  auto sub_options = rcl_subscription_get_default_options();
+  rcl_publisher_t cpp_pub = rcl_get_zero_initialized_publisher();
+  rcl_publisher_t c_pub = rcl_get_zero_initialized_publisher();
+  rcl_subscription_t c_sub = rcl_get_zero_initialized_subscription();
+  rcl_subscription_t cpp_sub = rcl_get_zero_initialized_subscription();
+  ASSERT_EQ(0, rcl_publisher_init(&cpp_pub, node, cpp_support, "/to_c", &options));
+  ASSERT_EQ(0, rcl_subscription_init(&c_sub, node, c_support, "/to_c", &sub_options));
+  ASSERT_EQ(0, rcl_publisher_init(&c_pub, node, c_support, "/to_cpp", &options));
+  ASSERT_EQ(0, rcl_subscription_init(&cpp_sub, node, cpp_support, "/to_cpp", &sub_options));
+  for (const auto & message : messages) {
+    SCOPED_TRACE(rosidl_generator_traits::name<T>());
+    ASSERT_EQ(0, rcl_publish(&cpp_pub, message.get(), nullptr));
+    rcl_ipc_message_t * c_owner;
+    const void * c_data;
+    ASSERT_EQ(0, rcl_take_ipc_message(&c_sub, &c_owner, &c_data, nullptr));
+    EXPECT_TRUE(*message == through_cdr<T>(c_data, c_support));
+    ASSERT_EQ(0, rcl_publish(&c_pub, c_data, nullptr));
+    rcl_ipc_message_release(c_owner);
+    rcl_ipc_message_t * cpp_owner;
+    const void * cpp_data;
+    ASSERT_EQ(0, rcl_take_ipc_message(&cpp_sub, &cpp_owner, &cpp_data, nullptr));
+    EXPECT_TRUE(*message == *static_cast<const T *>(cpp_data));
+    rcl_ipc_message_release(cpp_owner);
+  }
+  EXPECT_EQ(0, rcl_subscription_fini(&cpp_sub, node));
+  EXPECT_EQ(0, rcl_publisher_fini(&c_pub, node));
+  EXPECT_EQ(0, rcl_subscription_fini(&c_sub, node));
+  EXPECT_EQ(0, rcl_publisher_fini(&cpp_pub, node));
+}
 class BrokerTest : public ::testing::Test
 {
 protected:
@@ -224,6 +282,21 @@ TEST_F(BrokerTest, NestedAndBooleanSequences)
   EXPECT_STREQ("last", output->string_values.data[2].data);
   EXPECT_EQ(-123456789, output->basic_types_values.data[1].int64_value);
   test_msgs__msg__UnboundedSequences__destroy(output);
+}
+TEST_F(BrokerTest, EveryFieldKindConvertsBothWays)
+{
+  convert_both_ways(&node, ROSIDL_GET_MSG_TYPE_SUPPORT(test_msgs, msg, Arrays),
+    get_messages_arrays());
+  convert_both_ways(&node, ROSIDL_GET_MSG_TYPE_SUPPORT(test_msgs, msg, BoundedSequences),
+    get_messages_bounded_sequences());
+  convert_both_ways(&node, ROSIDL_GET_MSG_TYPE_SUPPORT(test_msgs, msg, UnboundedSequences),
+    get_messages_unbounded_sequences());
+  convert_both_ways(&node, ROSIDL_GET_MSG_TYPE_SUPPORT(test_msgs, msg, MultiNested),
+    get_messages_multi_nested());
+  convert_both_ways(&node, ROSIDL_GET_MSG_TYPE_SUPPORT(test_msgs, msg, Strings),
+    get_messages_strings());
+  convert_both_ways(&node, ROSIDL_GET_MSG_TYPE_SUPPORT(test_msgs, msg, WStrings),
+    get_messages_wstrings());
 }
 TEST_F(BrokerTest, TransientLocalPublisherFallsBack)
 {

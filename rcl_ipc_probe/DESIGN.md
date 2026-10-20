@@ -99,8 +99,8 @@ A C++ implementation of the hidden control block is fine.
 | --- | --- |
 | C++ -> same generated C++ ABI | Share const original; no message conversion. A const-reference publish must first copy into owned storage because the caller can mutate it after return. |
 | C -> C, rclrs using generated C backing | Share C owner; no conversion. Existing `rcl_take(out)` still deep-copies into caller storage. |
-| C++ -> C / Python | Convert fields directly from C++ to one cached C owner. Python's existing generated `convert_to_py` creates a normal Python object once **per mutable Python callback recipient**, not once globally. |
-| Python -> C / C++ | Existing `convert_from_py` snapshots a C owner once at publish. C++ recipients share one directly converted C++ owner per ABI/allocator key. Python objects are not retained as the canonical transport owner. |
+| C++ -> C / Python | Build one cached read-only C view whose arrays and strings alias the immutable C++ owner; only bool and string/message sequences need small element tables. Python's existing generated `convert_to_py` creates a normal Python object once **per mutable Python callback recipient**, not once globally. |
+| Python -> C / C++ | Existing `convert_from_py` snapshots a C owner once at publish. C++ recipients share one directly converted C++ owner per ABI/allocator key, built by the first taker on its thread so the allocation stays in that thread's arena. Python objects are not retained as the canonical transport owner. |
 | Rust native wrapper -> C | If the wrapper owns a generated C message, transfer that owner; otherwise a registered adapter constructs C once. Ordinary `rcl_publish` remains a borrowed-pointer API. |
 | typed -> serialized / generic | Serialize once per requested wire format and cache immutable bytes. No DDS traversal. |
 | serialized -> typed | Retain bytes and deserialize once into the target representation; a C bridge may then supply another language representation. |

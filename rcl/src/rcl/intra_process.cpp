@@ -140,6 +140,31 @@ void scalar(
       reinterpret_cast<const uint16_t *>(data), n)) {throw std::bad_alloc();}
   } else {copy(af.nested(a), src, bf.nested(b), dst);}
 }
+template<typename T>
+void assign(void * dst, const void * from, size_t n)
+{
+  auto first = static_cast<const T *>(from);
+  static_cast<std::vector<T> *>(dst)->assign(first, first + n);
+}
+// Unbounded C++ sequences are std::vector; assign skips the zero fill of resize.
+bool assign_vector(uint8_t type, void * dst, const void * from, size_t n)
+{
+  switch (type) {
+    case 1: assign<float>(dst, from, n); return true;
+    case 2: assign<double>(dst, from, n); return true;
+    case 3: assign<long double>(dst, from, n); return true;
+    case 4: case 7: case 8: assign<uint8_t>(dst, from, n); return true;
+    case 5: assign<char16_t>(dst, from, n); return true;
+    case 9: assign<int8_t>(dst, from, n); return true;
+    case 10: assign<uint16_t>(dst, from, n); return true;
+    case 11: assign<int16_t>(dst, from, n); return true;
+    case 12: assign<uint32_t>(dst, from, n); return true;
+    case 13: assign<int32_t>(dst, from, n); return true;
+    case 14: assign<uint64_t>(dst, from, n); return true;
+    case 15: assign<int64_t>(dst, from, n); return true;
+    default: return false;
+  }
+}
 void copy(const Schema & a, const void * src, const Schema & b, void * dst)
 {
   for (size_t i = 0; i < a.count(); ++i) {
@@ -148,6 +173,10 @@ void copy(const Schema & a, const void * src, const Schema & b, void * dst)
     auto dp = static_cast<char *>(dst) + bf.offset();
     if (!af.array()) {scalar(a, af, sp, b, bf, dp); continue;}
     size_t n = af.size(sp);
+    if (b.cpp && !bf.fixed() && af.type() < 16 && af.type() != 6) {
+      const void * from = n ? af.get_const()(sp, 0) : nullptr;
+      if (assign_vector(af.type(), dp, from, n)) {continue;}
+    }
     bf.resize(dp, n);
     if (!n) {continue;}
     if (af.type() < 16 && af.type() != 6) {
@@ -165,6 +194,91 @@ void copy(const Schema & a, const void * src, const Schema & b, void * dst)
     }
   }
 }
+struct Sequence
+{
+  void * data;
+  size_t size;
+  size_t capacity;
+};
+using Blocks = std::vector<void *>;
+void * block(Blocks & blocks, size_t bytes)
+{
+  blocks.reserve(blocks.size() + 1);
+  auto p = std::calloc(1, bytes);
+  if (!p) {throw std::bad_alloc();}
+  blocks.push_back(p);
+  return p;
+}
+void view(const Schema &, const void *, const Schema &, void *, Blocks &);
+size_t c_size(const Schema & c, const Field & cf)
+{
+  if (cf.type() == 16) {return sizeof(rosidl_runtime_c__String);}
+  if (cf.type() == 17) {return sizeof(rosidl_runtime_c__U16String);}
+  return cf.nested(c).size();
+}
+void view_scalar(
+  const Schema & a, const Field & af, const void * src,
+  const Schema & b, const Field & bf, void * dst, Blocks & blocks)
+{
+  if (af.type() < 16) {
+    std::memcpy(dst, src, width(af.type()));
+  } else if (af.type() == 16) {
+    auto from = static_cast<const std::string *>(src);
+    auto to = static_cast<rosidl_runtime_c__String *>(dst);
+    to->data = const_cast<char *>(from->c_str());
+    to->size = from->size();
+    to->capacity = from->size() + 1;
+  } else if (af.type() == 17) {
+    auto from = static_cast<const std::u16string *>(src);
+    auto to = static_cast<rosidl_runtime_c__U16String *>(dst);
+    to->data = reinterpret_cast<uint16_t *>(const_cast<char16_t *>(from->c_str()));
+    to->size = from->size();
+    to->capacity = from->size() + 1;
+  } else {
+    view(af.nested(a), src, bf.nested(b), dst, blocks);
+  }
+}
+// A read-only C message whose buffers alias the C++ source; only the blocks are owned.
+void view(const Schema & a, const void * src, const Schema & b, void * dst, Blocks & blocks)
+{
+  for (size_t i = 0; i < a.count(); ++i) {
+    auto af = field(a, i), bf = field(b, i);
+    auto sp = static_cast<const char *>(src) + af.offset();
+    auto dp = static_cast<char *>(dst) + bf.offset();
+    if (!af.array()) {view_scalar(a, af, sp, b, bf, dp, blocks); continue;}
+    size_t n = af.size(sp);
+    if (af.fixed() && !af.bounded()) {
+      if (af.type() < 16) {
+        std::memcpy(dp, sp, n * width(af.type()));
+      } else {
+        for (size_t j = 0; j < n; ++j) {
+          view_scalar(a, af, af.get_const()(sp, j), b, bf, bf.get()(dp, j), blocks);
+        }
+      }
+      continue;
+    }
+    auto sequence = reinterpret_cast<Sequence *>(dp);
+    *sequence = Sequence{nullptr, n, n};
+    if (!n) {continue;}
+    if (af.type() < 16 && af.type() != 6) {
+      sequence->data = const_cast<void *>(af.get_const()(sp, 0));
+    } else if (af.type() == 6) {
+      auto values = static_cast<bool *>(block(blocks, n));
+      sequence->data = values;
+      for (size_t j = 0; j < n; ++j) {
+        af.fetch()(sp, j, &values[j]);
+      }
+    } else {
+      size_t size = c_size(b, bf);
+      auto elements = static_cast<char *>(block(blocks, n * size));
+      sequence->data = elements;
+      for (size_t j = 0; j < n; ++j) {
+        view_scalar(a, af, af.get_const()(sp, j), b, bf, elements + j * size, blocks);
+      }
+    }
+  }
+}
+std::shared_ptr<void> convert(const Schema & source, const void * data, const Schema & target);
 std::shared_ptr<Schema> schema(const rosidl_message_type_support_t * support)
 {
   bool cpp = std::strstr(support->typesupport_identifier, "cpp") != nullptr;
@@ -191,10 +305,47 @@ std::shared_ptr<void> clone(const Schema & source, const void * data, const Sche
   copy(source, data, target, p);
   return result;
 }
+// One owned source per publication; the other language is converted once, by its first taker.
+struct Publication
+{
+  std::shared_ptr<void> source;
+  std::shared_ptr<Schema> type;
+  std::mutex mutex;
+  std::shared_ptr<void> converted;
+  const void * get(const Schema & target)
+  {
+    if (target.cpp == type->cpp) {return source.get();}
+    std::lock_guard<std::mutex> lock(mutex);
+    if (!converted) {converted = convert(*type, source.get(), target);}
+    return converted.get();
+  }
+};
+std::shared_ptr<void> convert(const Schema & source, const void * data, const Schema & target)
+{
+  if (target.cpp) {return clone(source, data, target);}
+  auto root = std::calloc(1, target.size());
+  if (!root) {throw std::bad_alloc();}
+  auto blocks = std::make_shared<Blocks>();
+  auto result = std::shared_ptr<void>(root, [blocks](void * value) {
+        for (auto p : *blocks) {
+          std::free(p);
+        }
+        std::free(value);
+      });
+  view(source, data, target, root, *blocks);
+  return result;
+}
+std::shared_ptr<Publication> publication(std::shared_ptr<void> source, std::shared_ptr<Schema> type)
+{
+  auto result = std::make_shared<Publication>();
+  result->source = std::move(source);
+  result->type = std::move(type);
+  return result;
+}
 using Gid = std::array<uint8_t, RMW_GID_STORAGE_SIZE>;
 struct Sample
 {
-  std::shared_ptr<void> owner;
+  std::shared_ptr<Publication> owner;
   rmw_message_info_t info;
 };
 struct Subscription
@@ -228,6 +379,25 @@ struct Publisher
   rosidl_type_hash_t hash;
   rmw_qos_profile_t qos;
   std::shared_ptr<Schema> type;
+  std::mutex module_mutex;
+  void (* release)(void *) = nullptr;
+  std::shared_ptr<void> module;
+  // dladdr and dlopen cost microseconds per call, so the owner module is looked up once.
+  std::shared_ptr<void> module_of(void (* function)(void *))
+  {
+    std::lock_guard<std::mutex> lock(module_mutex);
+    if (function != release) {
+      module.reset();
+      Dl_info info{};
+      if (dladdr(reinterpret_cast<void *>(function), &info)) {
+        if (auto handle = dlopen(info.dli_fname, RTLD_NOW | RTLD_NOLOAD)) {
+          module = std::shared_ptr<void>(handle, [](void * p) {dlclose(p);});
+        }
+      }
+      release = function;
+    }
+    return module;
+  }
 };
 bool unlimited(const rmw_time_t & value)
 {
@@ -261,7 +431,7 @@ rmw_ret_t prepare(
   auto pub = state.pub;
   std::lock_guard<std::mutex> lock(pub->broker->mutex);
   try {
-    std::map<bool, std::shared_ptr<void>> converted;
+    std::shared_ptr<Publication> shared;
     std::vector<std::pair<std::shared_ptr<Subscription>, Sample>> pending;
     for (auto & weak : pub->broker->subscriptions) {
       auto sub = weak.lock();
@@ -281,15 +451,13 @@ rmw_ret_t prepare(
         if (static_cast<int64_t>(info->publication_sequence_number) > sequence + 1) {continue;}
       }
       if (!known) {continue;}
-      auto & owner = converted[sub->type->cpp];
-      if (!owner) {
-        owner = publishing_owner.get() == message &&
-          sub->type->cpp == pub->type->cpp ? publishing_owner :
-          clone(*pub->type, message, *sub->type);
+      if (!shared) {
+        shared = publication(publishing_owner.get() == message ? publishing_owner :
+            clone(*pub->type, message, *pub->type), pub->type);
       }
       auto metadata = *info;
       metadata.from_intra_process = true;
-      pending.emplace_back(sub, Sample{owner, metadata});
+      pending.emplace_back(sub, Sample{shared, metadata});
     }
     state.excluded.reserve(pending.size());
     state.notify.reserve(pending.size());
@@ -413,6 +581,7 @@ void rcl_ipc_subscription_init(
             type->fini(p); std::free(p);
           });
           if (!decode(input, data)) {return {0, nullptr, nullptr};}
+          auto shared = publication(owner, sub->type);
           auto retired = std::make_unique<Sample>();
           std::lock_guard<std::mutex> lock(sub->mutex);
           if (sub->closed) {return {0, nullptr, nullptr};}
@@ -426,7 +595,7 @@ void rcl_ipc_subscription_init(
           }
           auto metadata = *info;
           metadata.reception_sequence_number = sub->reception++;
-          sub->queue.push_back(Sample{owner, metadata});
+          sub->queue.push_back(Sample{shared, metadata});
           sub->ready.store(sub->queue.size(), std::memory_order_release);
           return {grew ? 2 : 1, retired.release(), [](void * p) {delete static_cast<Sample *>(p);}};
         } catch (const std::bad_alloc &) {
@@ -487,13 +656,15 @@ rcl_ret_t rcl_take_ipc_message(
   try {
     if (!rcl_subscription_is_ipc_enabled(subscription)) {return RCL_RET_SUBSCRIPTION_TAKE_FAILED;}
     auto sub = *static_cast<std::shared_ptr<Subscription> *>(subscription->impl->ipc);
-    std::lock_guard<std::mutex> lock(sub->mutex);
-    if (sub->queue.empty()) {return RCL_RET_SUBSCRIPTION_TAKE_FAILED;}
     auto result = std::make_unique<rcl_ipc_message_t>();
-    result->sample = std::move(sub->queue.front());
-    sub->queue.erase(sub->queue.begin());
-    sub->ready.store(sub->queue.size(), std::memory_order_release);
-    *data = result->sample.owner.get();
+    {
+      std::lock_guard<std::mutex> lock(sub->mutex);
+      if (sub->queue.empty()) {return RCL_RET_SUBSCRIPTION_TAKE_FAILED;}
+      result->sample = std::move(sub->queue.front());
+      sub->queue.erase(sub->queue.begin());
+      sub->ready.store(sub->queue.size(), std::memory_order_release);
+    }
+    *data = result->sample.owner->get(*sub->type);
     if (info) {*info = result->sample.info;}
     *message = result.release();
     return RCL_RET_OK;
@@ -527,12 +698,9 @@ rcl_ret_t rcl_publish_ipc_owned(
 {
   std::unique_ptr<void, decltype(release)> consumed(value, release);
   try {
-    Dl_info info{};
     std::shared_ptr<void> module;
-    if (dladdr(reinterpret_cast<void *>(release), &info)) {
-      if (auto handle = dlopen(info.dli_fname, RTLD_NOW | RTLD_NOLOAD)) {
-        module = std::shared_ptr<void>(handle, [](void * p) {dlclose(p);});
-      }
+    if (rcl_publisher_is_ipc_enabled(publisher)) {
+      module = static_cast<Publisher *>(publisher->impl->ipc)->module_of(release);
     }
     consumed.release();
     auto owner = std::shared_ptr<void>(const_cast<void *>(data),
