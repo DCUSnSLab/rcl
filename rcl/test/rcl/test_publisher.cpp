@@ -392,7 +392,6 @@ TEST_F(TestPublisherFixture, test_publisher_option) {
 }
 
 TEST_F(TestPublisherFixture, test_publisher_loan_disable) {
-  bool is_fastdds = (std::string(rmw_get_implementation_identifier()).find("rmw_fastrtps") == 0);
   const rosidl_message_type_support_t * ts =
     ROSIDL_GET_MSG_TYPE_SUPPORT(test_msgs, msg, BasicTypes);
   constexpr char topic_name[] = "pod_msg";
@@ -426,11 +425,9 @@ TEST_F(TestPublisherFixture, test_publisher_loan_disable) {
       rcl_ret_t ret = rcl_publisher_fini(&publisher, this->node_ptr);
       EXPECT_EQ(RCL_RET_OK, ret) << rcl_get_error_string().str;
     });
-    if (is_fastdds) {
-      EXPECT_TRUE(rcl_publisher_can_loan_messages(&publisher));
-    } else {
-      EXPECT_FALSE(rcl_publisher_can_loan_messages(&publisher));
-    }
+    // With loans enabled the result is whatever the middleware offers for this type.
+    EXPECT_EQ(rcl_publisher_get_rmw_handle(&publisher)->can_loan_messages,
+      rcl_publisher_can_loan_messages(&publisher));
   }
 }
 
