@@ -22,10 +22,22 @@ struct Event
   uint64_t group = 0;
 };
 std::vector<Event> events;
+rcl_executor_item_t claimed;
+rcl_executor_trace_client_t claimed_client;
+uint64_t claimed_group;
+
 }  // namespace
 
 extern "C"
 {
+void rcl_executor_trace_claim(
+  const rcl_executor_t *, const rcl_executor_item_t * item,
+  uint64_t group, rcl_executor_trace_client_t client)
+{
+  claimed = *item;
+  claimed_group = group;
+  claimed_client = client;
+}
 void rcl_executor_trace_wait_enter(const rcl_executor_t * executor, int64_t timeout_ns)
 {
   events.push_back({ENTER, executor, timeout_ns});
@@ -51,15 +63,23 @@ TEST(Trace, arguments_order_and_wait_results)
   events.clear();
   rcl_executor_t * executor;
   ASSERT_EQ(RCL_RET_OK, rcl_executor_create(&executor));
+  EXPECT_EQ(1, rcl_executor_trace_contract_1());
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_set_trace_client(executor, RCL_EXECUTOR_TRACE_RCLCPP));
   auto handle = rcl_executor_get_handle(executor);
   ASSERT_EQ(RCL_RET_OK, rcl_executor_add_group(executor, 42, RCL_EXECUTOR_MUTUALLY_EXCLUSIVE));
   uint64_t id;
   ASSERT_EQ(RCL_RET_OK,
-    rcl_executor_add(executor, RCL_EXECUTOR_WORK, nullptr, nullptr, 42, &id));
+    rcl_executor_add(executor, RCL_EXECUTOR_WORK, nullptr, &id, 42, &id));
   ASSERT_EQ(RCL_RET_OK, rcl_executor_notify(executor, id, 1));
   ASSERT_EQ(RCL_EXECUTOR_READY, rcl_executor_wait(executor, 123));
   rcl_executor_item_t item;
   ASSERT_EQ(RCL_EXECUTOR_READY, rcl_executor_next(executor, &item));
+  EXPECT_EQ(item.registration, claimed.registration);
+  EXPECT_EQ(item.token, claimed.token);
+  EXPECT_EQ(item.entity, claimed.entity);
+  EXPECT_EQ(&id, claimed.context);
+  EXPECT_EQ(42u, claimed_group);
+  EXPECT_EQ(RCL_EXECUTOR_TRACE_RCLCPP, claimed_client);
   ASSERT_EQ(RCL_RET_OK, rcl_executor_complete(executor, item.token));
   ASSERT_EQ(4u, events.size());
   EXPECT_EQ(ENTER, events[0].phase);

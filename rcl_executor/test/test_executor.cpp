@@ -69,6 +69,25 @@ TEST_F(Core, group_claim_is_deferred_and_counts_rotate)
   EXPECT_EQ(RCL_RET_OK, rcl_executor_complete(executor, first.token));
 }
 
+// Clients key groups by address, so a removed group's key returns as a new group of another type.
+TEST_F(Core, removed_group_key_is_reused_with_another_type)
+{
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_add_group(executor, 1, RCL_EXECUTOR_MUTUALLY_EXCLUSIVE));
+  auto old = add(1);
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_remove(executor, old));
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_remove_group(executor, 1));
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_add_group(executor, 1, RCL_EXECUTOR_REENTRANT));
+  EXPECT_NE(RCL_RET_OK, rcl_executor_add_group(executor, 1, RCL_EXECUTOR_MUTUALLY_EXCLUSIVE));
+  rcl_reset_error();
+  auto a = add(1);
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_notify(executor, a, 2));
+  rcl_executor_item_t first{}, second{};
+  ASSERT_EQ(RCL_EXECUTOR_READY, rcl_executor_next(executor, &first));
+  ASSERT_EQ(RCL_EXECUTOR_READY, rcl_executor_next(executor, &second));
+  EXPECT_EQ(RCL_RET_OK, rcl_executor_complete(executor, first.token));
+  EXPECT_EQ(RCL_RET_OK, rcl_executor_complete(executor, second.token));
+}
+
 TEST_F(Core, no_spin_when_only_busy_groups_have_work)
 {
   ASSERT_EQ(RCL_RET_OK, rcl_executor_add_group(executor, 1, RCL_EXECUTOR_MUTUALLY_EXCLUSIVE));

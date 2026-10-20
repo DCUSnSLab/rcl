@@ -46,6 +46,11 @@ thread_local uint64_t partition_group = 0;
 thread_local uint64_t partition_generation = 0;
 thread_local uint32_t partition_heard = 0;
 
+// The middleware reports a sample once, to the callback installed at that time. Credits a removed
+// registration did not consume stay here for the next registration of the same handle.
+std::mutex residual_mutex;
+std::unordered_map<const void *, size_t> residual;
+
 struct Control
 {
   alignas(4) std::atomic<uint32_t> bell{0};
@@ -248,6 +253,7 @@ struct rcl_executor_s
   std::atomic<bool> spinning{false};
   bool partitioned = false;
   bool explicit_policy = true;
+  rcl_executor_trace_client_t trace_client = RCL_EXECUTOR_TRACE_OTHER;
   rcl_executor_thread_start_fn thread_start = nullptr;
   void * thread_context = nullptr;
 
@@ -262,9 +268,30 @@ struct rcl_executor_s
     auto self = entry->owner;
     {
       std::lock_guard<std::mutex> lock(self->mutex);
+      if (!entry->registered) {
+        keep_residual(*entry, count);
+        return;
+      }
       self->enqueue(self->entries.at(entry->id), count);
     }
     self->ring(1);
+  }
+
+  static void keep_residual(const Entry & entry, size_t count)
+  {
+    if (count == 0) {return;}
+    std::lock_guard<std::mutex> lock(residual_mutex);
+    residual[entry.entity] += count;
+  }
+
+  static size_t take_residual(const Entry & entry)
+  {
+    std::lock_guard<std::mutex> lock(residual_mutex);
+    auto found = residual.find(entry.entity);
+    if (found == residual.end()) {return 0;}
+    auto count = found->second;
+    residual.erase(found);
+    return count;
   }
 
   static void reset_timer(const void * data, size_t)
@@ -621,15 +648,17 @@ rcl_ret_t rcl_executor_add_group(
                throw std::invalid_argument("partition mode refuses Reentrant callback groups");
              }
              auto inserted = executor->groups.emplace(group, Group{type});
-             if (!inserted.first->second.enabled) {
-               inserted.first->second.enabled = true;
-               ++inserted.first->second.generation;
+             auto & value = inserted.first->second;
+             if (!inserted.second && value.type != type) {
+               if (value.enabled) {throw std::invalid_argument("group type cannot change");}
+               value.type = type;
+             }
+             if (!value.enabled) {
+               value.enabled = true;
+               ++value.generation;
                executor->ring();
              }
              if (executor->partitioned && inserted.second) {executor->ring();}
-             if (!inserted.second && inserted.first->second.type != type) {
-               throw std::invalid_argument("group type cannot change");
-             }
     });
 }
 
@@ -687,6 +716,10 @@ rcl_ret_t rcl_executor_add(
                (void)ignored;
                check(result);
              }
+             if (entry->entity && !entry->clock) {
+               std::lock_guard<std::mutex> lock(executor->mutex);
+               executor->enqueue(entry, rcl_executor_t::take_residual(*entry));
+             }
              *registration = entry->id;
              executor->control->ring();
     });
@@ -709,6 +742,9 @@ rcl_ret_t rcl_executor_remove(rcl_executor_t * executor, rcl_executor_id_t regis
       // Clearing a readiness callback joins in-flight middleware callbacks.
              check(rcl_executor_t::callback(*entry, false));
              std::lock_guard<std::mutex> lock(executor->mutex);
+             if (entry->entity && !entry->clock) {
+               rcl_executor_t::keep_residual(*entry, entry->pending);
+             }
              executor->entries.erase(registration);
              executor->ready.erase(std::remove(executor->ready.begin(), executor->ready.end(),
         entry),
@@ -867,6 +903,7 @@ rcl_executor_result_t rcl_executor_next_excluding(
     ++entry->active;
     executor->claims.emplace(item->token, entry);
     rcl_executor_trace_item_claimed(executor, entry->id, entry->type, entry->group);
+    rcl_executor_trace_claim(executor, item, entry->group, executor->trace_client);
     // Readiness wakes one thread; it passes the wake on while claimable work remains.
     if (executor->any_eligible()) {executor->ring(1);}
     return RCL_EXECUTOR_READY;
@@ -998,3 +1035,13 @@ rcl_ret_t rcl_executor_spin(
   return result;
 }
 }  // extern "C"
+
+rcl_ret_t rcl_executor_set_trace_client(
+  rcl_executor_t * executor, rcl_executor_trace_client_t client)
+{
+  std::lock_guard<std::mutex> lock(executor->mutex);
+  executor->trace_client = client;
+  return RCL_RET_OK;
+}
+
+int rcl_executor_trace_contract_1(void) {return 1;}

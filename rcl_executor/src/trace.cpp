@@ -16,6 +16,12 @@
 
 extern "C"
 {
+TRACE_NOINLINE void rcl_executor_trace_claim(
+  const rcl_executor_t * executor, const rcl_executor_item_t * item,
+  uint64_t group, rcl_executor_trace_client_t client)
+{
+  asm volatile("" : : "g" (executor), "g" (item), "g" (group), "g" (client) : "memory");
+}
 TRACE_NOINLINE void rcl_executor_trace_wait_enter(
   const rcl_executor_t * executor, int64_t timeout_ns)
 {
