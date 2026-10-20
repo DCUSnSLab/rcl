@@ -35,6 +35,8 @@
 #include <unistd.h>
 #endif
 
+#include "rcl_executor/trace.h"
+
 namespace
 {
 using Steady = std::chrono::steady_clock;
@@ -92,6 +94,7 @@ struct Group
 {
   rcl_executor_group_type_t type;
   size_t active = 0;
+  int32_t priority = 0;
 };
 struct Entry;
 struct Clock
@@ -124,6 +127,7 @@ struct Entry
   const void * entity;
   void * context;
   uint64_t group;
+  uint64_t order = 0;
   size_t pending = 0;
   size_t active = 0;
   bool registered = true;
@@ -225,6 +229,9 @@ struct rcl_executor_s
   std::unordered_map<uint64_t, std::shared_ptr<Entry>> claims;
   std::unordered_map<uint64_t, std::unique_ptr<Clock>> clocks;
   std::deque<std::shared_ptr<Entry>> ready;
+  rcl_executor_selection_policy_t policy = RCL_EXECUTOR_FIFO;
+  std::vector<std::shared_ptr<Entry>> round;
+  bool in_round = false;
   uint64_t sequence = 0;
   uint64_t token_sequence = 0;
   uint64_t clock_sequence = 0;
@@ -349,6 +356,66 @@ struct rcl_executor_s
            (group.type == RCL_EXECUTOR_REENTRANT || group.active == 0);
   }
 
+  static int kind(const Entry & entry)
+  {
+    switch (entry.type) {
+      case RCL_EXECUTOR_TIMER: return 0;
+      case RCL_EXECUTOR_SUBSCRIPTION: return 1;
+      case RCL_EXECUTOR_SERVICE: return 2;
+      case RCL_EXECUTOR_CLIENT: return 3;
+      default: return 4;
+    }
+  }
+
+  void start_round()
+  {
+    round.clear();
+    for (auto & entry : ready) {
+      if (eligible(*entry)) {round.push_back(entry);}
+    }
+    std::sort(round.begin(), round.end(), [](const auto & a, const auto & b) {
+        if (kind(*a) != kind(*b)) {return kind(*a) < kind(*b);}
+        if (a->order != b->order) {return a->order < b->order;}
+        return a->id < b->id;
+      });
+    in_round = true;
+  }
+
+  std::shared_ptr<Entry> select(const rcl_executor_id_t * excluded, size_t count)
+  {
+    auto allowed = [&](const auto & entry) {
+        return count == 0 || std::find(excluded, excluded + count, entry->id) == excluded + count;
+      };
+    if (policy == RCL_EXECUTOR_WAIT_SET) {
+      if (!in_round) {start_round();}
+      for (auto it = round.begin(); it != round.end(); ) {
+        auto entry = *it;
+        if (!eligible(*entry)) {
+          if (entry->registered && entry->pending && entry->type == RCL_EXECUTOR_TIMER) {
+            ++it;
+          } else {
+            it = round.erase(it);
+          }
+          continue;
+        }
+        if (!allowed(entry)) {++it; continue;}
+        round.erase(it);
+        return entry;
+      }
+      in_round = false;
+      return nullptr;
+    }
+    std::shared_ptr<Entry> selected;
+    for (const auto & entry : ready) {
+      if (!eligible(*entry) || !allowed(entry)) {continue;}
+      if (policy == RCL_EXECUTOR_FIFO) {return entry;}
+      if (!selected || groups.at(entry->group).priority > groups.at(selected->group).priority) {
+        selected = entry;
+      }
+    }
+    return selected;
+  }
+
   // A spin thread completing its own claim loops back to claim again, so it needs no wake.
   rcl_ret_t complete(uint64_t token, bool wake)
   {
@@ -368,6 +435,7 @@ struct rcl_executor_s
                  executor->schedule(*entry);
                }
                executor->claims.erase(found);
+               rcl_executor_trace_item_completed(executor, entry->id);
                if (entry->one_shot) {executor->entries.erase(entry->id);}
              // Only a released group or a rescheduled observer can change what waiters see.
                if (observer || (wake &&
@@ -389,7 +457,41 @@ extern "C"
 {
 rcl_ret_t rcl_executor_create(rcl_executor_t ** executor)
 {
-  return boundary([&] {*executor = new rcl_executor_t;});
+  return rcl_executor_create_with_policy(executor, RCL_EXECUTOR_FIFO);
+}
+
+rcl_ret_t rcl_executor_create_with_policy(
+  rcl_executor_t ** executor, rcl_executor_selection_policy_t policy)
+{
+  return boundary([&] {
+             if (policy != RCL_EXECUTOR_FIFO && policy != RCL_EXECUTOR_WAIT_SET &&
+             policy != RCL_EXECUTOR_PRIORITY)
+             {
+               throw std::invalid_argument("unknown selection policy");
+             }
+             auto result = std::make_unique<rcl_executor_t>();
+             result->policy = policy;
+             *executor = result.release();
+    });
+}
+
+rcl_ret_t rcl_executor_set_group_priority(
+  rcl_executor_t * executor, uint64_t group, int32_t priority)
+{
+  return boundary([&] {
+             std::lock_guard<std::mutex> lock(executor->mutex);
+             executor->groups.at(group).priority = priority;
+             executor->control->ring(0, 1);
+    });
+}
+
+rcl_ret_t rcl_executor_set_order(
+  rcl_executor_t * executor, rcl_executor_id_t registration, uint64_t order)
+{
+  return boundary([&] {
+             std::lock_guard<std::mutex> lock(executor->mutex);
+             executor->entries.at(registration)->order = order;
+    });
 }
 
 void rcl_executor_destroy(rcl_executor_t * executor)
@@ -423,6 +525,11 @@ void rcl_executor_stop(rcl_executor_handle_t * handle) {handle->control->ring(1)
 void rcl_executor_reset(rcl_executor_t * executor)
 {
   executor->control->bell.fetch_and(~uint32_t(3), std::memory_order_acq_rel);
+  if (executor->policy == RCL_EXECUTOR_WAIT_SET) {
+    std::lock_guard<std::mutex> lock(executor->mutex);
+    executor->round.clear();
+    executor->in_round = false;
+  }
 }
 
 rcl_ret_t rcl_executor_add_group(
@@ -454,6 +561,7 @@ rcl_ret_t rcl_executor_add(
                  throw std::invalid_argument("unknown group");
                }
                entry->id = ++executor->sequence;
+               entry->order = entry->id;
                if (type == RCL_EXECUTOR_TIMER || type == RCL_EXECUTOR_TIMER_OBSERVER) {
                  rcl_clock_t * clock;
                  check(rcl_timer_clock(static_cast<const rcl_timer_t *>(entity), &clock));
@@ -556,6 +664,7 @@ rcl_ret_t rcl_executor_post(
              auto entry = std::make_shared<Entry>();
              entry->owner = executor;
              entry->id = ++executor->sequence;
+             entry->order = entry->id;
              entry->type = RCL_EXECUTOR_WORK;
              entry->entity = nullptr;
              entry->context = context;
@@ -568,7 +677,7 @@ rcl_ret_t rcl_executor_post(
     });
 }
 
-rcl_executor_result_t rcl_executor_wait(rcl_executor_t * executor, int64_t timeout_ns)
+static rcl_executor_result_t wait_impl(rcl_executor_t * executor, int64_t timeout_ns)
 {
   auto start = Steady::now();
   try {
@@ -599,6 +708,14 @@ rcl_executor_result_t rcl_executor_wait(rcl_executor_t * executor, int64_t timeo
   }
 }
 
+rcl_executor_result_t rcl_executor_wait(rcl_executor_t * executor, int64_t timeout_ns)
+{
+  rcl_executor_trace_wait_enter(executor, timeout_ns);
+  auto result = wait_impl(executor, timeout_ns);
+  rcl_executor_trace_wait_exit(executor, result);
+  return result;
+}
+
 rcl_executor_result_t rcl_executor_next(rcl_executor_t * executor, rcl_executor_item_t * item)
 {
   return rcl_executor_next_excluding(executor, item, nullptr, 0);
@@ -614,14 +731,9 @@ rcl_executor_result_t rcl_executor_next_excluding(
     executor->timers();
     std::shared_ptr<Entry> entry;
     for (;; ) {
-      auto found = std::find_if(executor->ready.begin(), executor->ready.end(),
-          [&](const auto & candidate) {
-            return executor->eligible(*candidate) && (excluded_count == 0 ||
-                   std::find(excluded, excluded + excluded_count, candidate->id) ==
-                   excluded + excluded_count);
-        });
-      if (found == executor->ready.end()) {return RCL_EXECUTOR_TIMEOUT;}
-      entry = *found;
+      entry = executor->select(excluded, excluded_count);
+      if (!entry) {return RCL_EXECUTOR_TIMEOUT;}
+      auto found = std::find(executor->ready.begin(), executor->ready.end(), entry);
       executor->ready.erase(found);
       --entry->pending;
       if (entry->pending) {executor->ready.push_back(entry);}
@@ -654,7 +766,7 @@ rcl_executor_result_t rcl_executor_next_excluding(
     ++executor->groups.at(entry->group).active;
     ++entry->active;
     executor->claims.emplace(item->token, entry);
-    // Readiness wakes one thread; it passes the wake on while claimable work remains.
+    rcl_executor_trace_item_claimed(executor, entry->id, entry->type, entry->group);
     // Readiness wakes one thread; it passes the wake on while claimable work remains.
     if (executor->any_eligible()) {executor->control->ring(0, 1);}
     return RCL_EXECUTOR_READY;

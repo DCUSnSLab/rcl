@@ -50,6 +50,19 @@ typedef enum rcl_executor_entity_type_e
   RCL_EXECUTOR_TIMER_OBSERVER
 } rcl_executor_entity_type_t;
 
+typedef enum rcl_executor_selection_policy_e
+{
+  RCL_EXECUTOR_FIFO,
+  // One readiness snapshot per round, one take per entity, in wait-set slot order:
+  // timers, subscriptions, services, clients, then waitables (event/guard/work/observer).
+  // New readiness, including timers becoming due mid-round, waits for the next round.
+  // Busy exclusive groups are omitted from new rounds; within a round their timers
+  // remain, while other entities are consumed and skipped. Exhaustion starts a new round.
+  RCL_EXECUTOR_WAIT_SET,
+  // Highest group priority first (default zero); FIFO among equal priorities.
+  RCL_EXECUTOR_PRIORITY
+} rcl_executor_selection_policy_t;
+
 typedef enum rcl_executor_result_e
 {
   RCL_EXECUTOR_READY,
@@ -77,6 +90,16 @@ typedef void (*rcl_executor_dispatch_fn)(const rcl_executor_item_t * item, void 
 
 RCL_EXECUTOR_PUBLIC
 rcl_ret_t rcl_executor_create(rcl_executor_t ** executor);
+RCL_EXECUTOR_PUBLIC
+rcl_ret_t rcl_executor_create_with_policy(
+  rcl_executor_t ** executor, rcl_executor_selection_policy_t policy);
+RCL_EXECUTOR_PUBLIC
+rcl_ret_t rcl_executor_set_group_priority(
+  rcl_executor_t * executor, uint64_t group, int32_t priority);
+// Clients supply their entity collection slot ordinal; defaults to registration order.
+RCL_EXECUTOR_PUBLIC
+rcl_ret_t rcl_executor_set_order(
+  rcl_executor_t * executor, rcl_executor_id_t registration, uint64_t order);
 // Stop and join drivers and finish outstanding claims before destroying the executor.
 RCL_EXECUTOR_PUBLIC
 void rcl_executor_destroy(rcl_executor_t * executor);

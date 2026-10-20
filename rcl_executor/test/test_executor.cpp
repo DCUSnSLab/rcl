@@ -210,3 +210,91 @@ TEST_F(Core, equivalent_clock_handles_do_not_multiply_deadline_queries)
   EXPECT_EQ(RCL_RET_OK, rcl_context_fini(&context));
   EXPECT_EQ(RCL_RET_OK, rcl_init_options_fini(&options));
 }
+
+TEST(CorePolicy, priority_drains_highest_and_rotates_equal_priorities)
+{
+  rcl_executor_t * executor;
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_create_with_policy(&executor, RCL_EXECUTOR_PRIORITY));
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_add_group(executor, 1, RCL_EXECUTOR_REENTRANT));
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_add_group(executor, 2, RCL_EXECUTOR_REENTRANT));
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_set_group_priority(executor, 1, -5));
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_set_group_priority(executor, 2, 10));
+  uint64_t low, high, equal;
+  ASSERT_EQ(RCL_RET_OK,
+    rcl_executor_add(executor, RCL_EXECUTOR_WORK, nullptr, nullptr, 1, &low));
+  ASSERT_EQ(RCL_RET_OK,
+    rcl_executor_add(executor, RCL_EXECUTOR_WORK, nullptr, nullptr, 2, &high));
+  ASSERT_EQ(RCL_RET_OK,
+    rcl_executor_add(executor, RCL_EXECUTOR_WORK, nullptr, nullptr, 2, &equal));
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_notify(executor, low, 3));
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_notify(executor, high, 3));
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_notify(executor, equal, 2));
+  for (auto expected : {high, equal, high, equal, high, low, low, low}) {
+    rcl_executor_item_t item;
+    ASSERT_EQ(RCL_EXECUTOR_READY, rcl_executor_next(executor, &item));
+    EXPECT_EQ(expected, item.registration);
+    ASSERT_EQ(RCL_RET_OK, rcl_executor_complete(executor, item.token));
+  }
+  rcl_executor_destroy(executor);
+}
+
+TEST(CorePolicy, wait_set_round_defers_arrivals_and_takes_one_per_entity)
+{
+  rcl_executor_t * executor;
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_create_with_policy(&executor, RCL_EXECUTOR_WAIT_SET));
+  uint64_t first, second, late;
+  ASSERT_EQ(RCL_RET_OK,
+    rcl_executor_add(executor, RCL_EXECUTOR_WORK, nullptr, nullptr, 0, &first));
+  ASSERT_EQ(RCL_RET_OK,
+    rcl_executor_add(executor, RCL_EXECUTOR_WORK, nullptr, nullptr, 0, &second));
+  ASSERT_EQ(RCL_RET_OK,
+    rcl_executor_add(executor, RCL_EXECUTOR_WORK, nullptr, nullptr, 0, &late));
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_set_order(executor, late, 0));
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_notify(executor, second, 2));
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_notify(executor, first, 2));
+  rcl_executor_item_t item;
+  ASSERT_EQ(RCL_EXECUTOR_READY, rcl_executor_next(executor, &item));
+  EXPECT_EQ(first, item.registration);
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_complete(executor, item.token));
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_notify(executor, late, 1));
+  ASSERT_EQ(RCL_EXECUTOR_READY, rcl_executor_next(executor, &item));
+  EXPECT_EQ(second, item.registration);
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_complete(executor, item.token));
+  EXPECT_EQ(RCL_EXECUTOR_TIMEOUT, rcl_executor_next(executor, &item));
+  for (auto expected : {late, first, second}) {
+    ASSERT_EQ(RCL_EXECUTOR_READY, rcl_executor_next(executor, &item));
+    EXPECT_EQ(expected, item.registration);
+    ASSERT_EQ(RCL_RET_OK, rcl_executor_complete(executor, item.token));
+  }
+  rcl_executor_destroy(executor);
+}
+
+TEST(CorePolicy, wait_set_skips_busy_groups_without_losing_their_backlog)
+{
+  rcl_executor_t * executor;
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_create_with_policy(&executor, RCL_EXECUTOR_WAIT_SET));
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_add_group(executor, 1, RCL_EXECUTOR_MUTUALLY_EXCLUSIVE));
+  uint64_t first, skipped, other;
+  ASSERT_EQ(RCL_RET_OK,
+    rcl_executor_add(executor, RCL_EXECUTOR_WORK, nullptr, nullptr, 1, &first));
+  ASSERT_EQ(RCL_RET_OK,
+    rcl_executor_add(executor, RCL_EXECUTOR_WORK, nullptr, nullptr, 1, &skipped));
+  ASSERT_EQ(RCL_RET_OK,
+    rcl_executor_add(executor, RCL_EXECUTOR_WORK, nullptr, nullptr, 0, &other));
+  for (auto id : {first, skipped, other}) {
+    ASSERT_EQ(RCL_RET_OK, rcl_executor_notify(executor, id, 1));
+  }
+  rcl_executor_item_t held, item;
+  ASSERT_EQ(RCL_EXECUTOR_READY, rcl_executor_next(executor, &held));
+  EXPECT_EQ(first, held.registration);
+  ASSERT_EQ(RCL_EXECUTOR_READY, rcl_executor_next(executor, &item));
+  EXPECT_EQ(other, item.registration);
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_complete(executor, item.token));
+  ASSERT_EQ(RCL_EXECUTOR_TIMEOUT, rcl_executor_next(executor, &item));
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_complete(executor, held.token));
+  ASSERT_EQ(RCL_EXECUTOR_READY, rcl_executor_wait(executor, 0));
+  ASSERT_EQ(RCL_EXECUTOR_READY, rcl_executor_next(executor, &item));
+  EXPECT_EQ(skipped, item.registration);
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_complete(executor, item.token));
+  rcl_executor_destroy(executor);
+}
