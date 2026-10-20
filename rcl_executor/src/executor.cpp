@@ -79,21 +79,23 @@ struct Control
 
   void sleep(uint32_t expected, int64_t ns)
   {
+    sleepers.fetch_add(1, std::memory_order_seq_cst);
 #ifdef __linux__
     timespec timeout{};
     if (ns >= 0) {
       timeout.tv_sec = ns / 1000000000;
       timeout.tv_nsec = ns % 1000000000;
     }
-    sleepers.fetch_add(1, std::memory_order_seq_cst);
     syscall(SYS_futex, &bell, FUTEX_WAIT_PRIVATE, expected,
       ns < 0 ? nullptr : &timeout, nullptr, 0);
-    sleepers.fetch_sub(1, std::memory_order_relaxed);
 #else
-    std::unique_lock<std::mutex> lock(mutex);
-    auto changed = [&] {return bell.load(std::memory_order_acquire) != expected;};
-    if (ns < 0) {condition.wait(lock, changed);} else {condition.wait_for(lock, Ns(ns), changed);}
+    {
+      std::unique_lock<std::mutex> lock(mutex);
+      auto changed = [&] {return bell.load(std::memory_order_acquire) != expected;};
+      if (ns < 0) {condition.wait(lock, changed);} else {condition.wait_for(lock, Ns(ns), changed);}
+    }
 #endif
+    sleepers.fetch_sub(1, std::memory_order_relaxed);
   }
 };
 static_assert(std::atomic<uint32_t>::is_always_lock_free,
@@ -904,8 +906,11 @@ rcl_executor_result_t rcl_executor_next_excluding(
     executor->claims.emplace(item->token, entry);
     rcl_executor_trace_item_claimed(executor, entry->id, entry->type, entry->group);
     rcl_executor_trace_claim(executor, item, entry->group, executor->trace_client);
-    // Readiness wakes one thread; it passes the wake on while claimable work remains.
-    if (executor->any_eligible()) {executor->ring(1);}
+    // Readiness wakes one thread; it passes the wake on while claimable work remains. A thread
+    // not yet asleep saw this work under the lock, or sleeps only until its next timer deadline.
+    if (executor->control->sleepers.load(std::memory_order_seq_cst) && executor->any_eligible()) {
+      executor->ring(1);
+    }
     return RCL_EXECUTOR_READY;
   } catch (const std::exception & error) {
     RCL_SET_ERROR_MSG(error.what());
