@@ -37,6 +37,7 @@ extern "C"
 
 #include "./common.h"
 #include "./subscription_impl.h"
+#include "./intra_process_internal.h"
 
 
 rcl_subscription_t
@@ -136,6 +137,7 @@ rcl_subscription_init(
     goto fail;
   }
   subscription->impl->type_hash = *type_support->get_type_hash_func(type_support);
+  rcl_ipc_subscription_init(subscription, type_support);
 
   RCUTILS_LOG_DEBUG_NAMED(ROS_PACKAGE_NAME, "Subscription initialized");
   ret = RCL_RET_OK;
@@ -151,6 +153,7 @@ rcl_subscription_init(
 fail:
   if (subscription->impl) {
     if (subscription->impl->rmw_handle) {
+      rcl_subscription_disable_ipc(subscription);
       rmw_ret_t rmw_fail_ret = rmw_destroy_subscription(
         rcl_node_get_rmw_handle(node), subscription->impl->rmw_handle);
       if (RMW_RET_OK != rmw_fail_ret) {
@@ -199,6 +202,7 @@ rcl_subscription_fini(rcl_subscription_t * subscription, rcl_node_t * node)
     if (!rmw_node) {
       return RCL_RET_INVALID_ARGUMENT;
     }
+    rcl_subscription_disable_ipc(subscription);
     rmw_ret_t ret =
       rmw_destroy_subscription(rmw_node, subscription->impl->rmw_handle);
     if (ret != RMW_RET_OK) {
@@ -559,6 +563,10 @@ rcl_take(
   rmw_message_info_t dummy_message_info;
   rmw_message_info_t * message_info_local = message_info ? message_info : &dummy_message_info;
   *message_info_local = rmw_get_zero_initialized_message_info();
+  if (rcl_subscription_is_ipc_enabled(subscription)) {
+    rcl_ret_t local = rcl_ipc_take_copy(subscription, ros_message, message_info_local);
+    if (local != RCL_RET_SUBSCRIPTION_TAKE_FAILED) {return local;}
+  }
   // Call rmw_take_with_info.
   bool taken = false;
   rmw_ret_t ret = rmw_take_with_info(
@@ -815,7 +823,7 @@ rcl_subscription_can_loan_messages(const rcl_subscription_t * subscription)
     return false;  // error message already set
   }
 
-  if (subscription->impl->options.disable_loaned_message) {
+  if (subscription->impl->ipc || subscription->impl->options.disable_loaned_message) {
     return false;
   }
 

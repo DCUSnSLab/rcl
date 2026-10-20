@@ -39,6 +39,7 @@ extern "C"
 #include "./arguments_impl.h"
 #include "./common.h"
 #include "./context_impl.h"
+#include "./intra_process_internal.h"
 #include "./init_options_impl.h"
 
 static atomic_uint_least64_t __rcl_next_unique_id = ATOMIC_VAR_INIT(1);
@@ -91,6 +92,7 @@ rcl_init(
     context->impl, "failed to allocate memory for context impl", return RCL_RET_BAD_ALLOC);
 
   // Zero initialize rmw context first so its validity can by checked in cleanup.
+  context->impl->ipc = NULL;
   context->impl->rmw_context = rmw_get_zero_initialized_context();
 
   // Store the allocator.
@@ -311,6 +313,7 @@ rcl_init(
     fail_ret = rcl_convert_rmw_ret_to_rcl_ret(rmw_ret);
     goto fail;
   }
+  rcl_ipc_context_init(context);
 
   TRACETOOLS_TRACEPOINT(rcl_init, (const void *)context);
 

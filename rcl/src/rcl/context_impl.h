@@ -28,6 +28,7 @@ extern "C"
 /// \internal
 struct rcl_context_impl_s
 {
+  void * ipc;
   /// Allocator used during init and shutdown.
   rcl_allocator_t allocator;
   /// Copy of init options given during init.

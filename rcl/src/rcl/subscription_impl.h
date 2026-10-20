@@ -21,6 +21,7 @@
 
 struct rcl_subscription_impl_s
 {
+  void * ipc;
   rcl_context_t * context;
   rcl_subscription_options_t options;
   rmw_qos_profile_t actual_qos;

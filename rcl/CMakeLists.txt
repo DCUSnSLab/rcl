@@ -5,6 +5,8 @@ project(rcl)
 find_package(ament_cmake_ros REQUIRED)
 find_package(ament_cmake_gen_version_h REQUIRED)
 
+find_package(rosidl_typesupport_introspection_c REQUIRED)
+find_package(rosidl_typesupport_introspection_cpp REQUIRED)
 find_package(Threads REQUIRED)
 find_package(libyaml_vendor REQUIRED)
 find_package(rcl_interfaces REQUIRED)
@@ -51,6 +53,7 @@ set(${PROJECT_NAME}_sources
   src/rcl/graph.c
   src/rcl/guard_condition.c
   src/rcl/guard_condition_callback.cpp
+  src/rcl/intra_process.cpp
   src/rcl/ipc_prototype.cpp
   src/rcl/init.c
   src/rcl/init_options.c
@@ -100,6 +103,9 @@ target_link_libraries(${PROJECT_NAME} PUBLIC
   ${type_description_interfaces_TARGETS}
 )
 target_link_libraries(${PROJECT_NAME} PRIVATE
+  rosidl_typesupport_introspection_c::rosidl_typesupport_introspection_c
+  rosidl_typesupport_introspection_cpp::rosidl_typesupport_introspection_cpp
+  ${CMAKE_DL_LIBS}
   Threads::Threads
   ${RCL_LOGGING_IMPL}::${RCL_LOGGING_IMPL}
   ${service_msgs_TARGETS}

@@ -21,6 +21,7 @@
 
 struct rcl_publisher_impl_s
 {
+  void * ipc;
   rcl_publisher_options_t options;
   rmw_qos_profile_t actual_qos;
   rcl_context_t * context;

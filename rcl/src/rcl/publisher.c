@@ -35,6 +35,7 @@ extern "C"
 
 #include "./common.h"
 #include "./publisher_impl.h"
+#include "./intra_process_internal.h"
 
 rcl_publisher_t
 rcl_get_zero_initialized_publisher(void)
@@ -143,6 +144,7 @@ rcl_publisher_init(
   RCUTILS_LOG_DEBUG_NAMED(ROS_PACKAGE_NAME, "Publisher initialized");
   // context
   publisher->impl->context = node->context;
+  rcl_ipc_publisher_init(publisher, type_support);
   TRACETOOLS_TRACEPOINT(
     rcl_publisher_init,
     (const void *)publisher,
@@ -155,6 +157,7 @@ rcl_publisher_init(
 fail:
   if (publisher->impl) {
     if (publisher->impl->rmw_handle) {
+      rcl_ipc_publisher_fini(publisher);
       rmw_ret_t rmw_fail_ret = rmw_destroy_publisher(
         rcl_node_get_rmw_handle(node), publisher->impl->rmw_handle);
       if (RMW_RET_OK != rmw_fail_ret) {
@@ -195,6 +198,7 @@ rcl_publisher_fini(rcl_publisher_t * publisher, rcl_node_t * node)
     if (!rmw_node) {
       return RCL_RET_INVALID_ARGUMENT;
     }
+    rcl_ipc_publisher_fini(publisher);
     rmw_ret_t ret =
       rmw_destroy_publisher(rmw_node, publisher->impl->rmw_handle);
     if (ret != RMW_RET_OK) {
@@ -280,6 +284,9 @@ rcl_publish(
   }
   RCL_CHECK_ARGUMENT_FOR_NULL(ros_message, RCL_RET_INVALID_ARGUMENT);
   TRACETOOLS_TRACEPOINT(rcl_publish, (const void *)publisher, (const void *)ros_message);
+  if (rcl_publisher_is_ipc_enabled(publisher)) {
+    return rcl_ipc_publish(publisher, ros_message);
+  }
   if (rmw_publish(publisher->impl->rmw_handle, ros_message, allocation) != RMW_RET_OK) {
     RCL_SET_ERROR_MSG(rmw_get_error_string().str);
     return RCL_RET_ERROR;
