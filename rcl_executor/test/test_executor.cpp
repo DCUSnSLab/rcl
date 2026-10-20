@@ -9,10 +9,17 @@
 #include <gtest/gtest.h>
 #include <rcl_executor/executor.h>
 #include <rcl/rcl.h>
+#include <rcl/error_handling.h>
 #include <atomic>
 #include <chrono>
 #include <csignal>
+#include <future>
+#include <memory>
 #include <thread>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 class Core : public ::testing::Test
@@ -297,4 +304,144 @@ TEST(CorePolicy, wait_set_skips_busy_groups_without_losing_their_backlog)
   EXPECT_EQ(skipped, item.registration);
   ASSERT_EQ(RCL_RET_OK, rcl_executor_complete(executor, item.token));
   rcl_executor_destroy(executor);
+}
+
+TEST_F(Core, thread_start_runs_once_on_each_dispatch_thread)
+{
+  struct State
+  {
+    std::mutex mutex;
+    std::unordered_map<std::thread::id, size_t> starts;
+    std::unordered_set<size_t> indices;
+    std::atomic<size_t> calls{0};
+    rcl_executor_handle_t * handle;
+  } state;
+  state.handle = handle;
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_set_thread_start(executor,
+    [](size_t index, uint64_t group, void * data) {
+      auto & s = *static_cast<State *>(data);
+      std::lock_guard<std::mutex> lock(s.mutex);
+      EXPECT_EQ(0u, group);
+      ++s.starts[std::this_thread::get_id()];
+      EXPECT_TRUE(s.indices.insert(index).second);
+    }, &state));
+  for (int i = 0; i < 100; ++i) {
+    ASSERT_EQ(RCL_RET_OK, rcl_executor_post(executor, [](void * data) {
+        auto & s = *static_cast<State *>(data);
+        {
+          std::lock_guard<std::mutex> lock(s.mutex);
+          EXPECT_EQ(1u, s.starts.at(std::this_thread::get_id()));
+        }
+        if (++s.calls == 100) {rcl_executor_stop(s.handle);}
+      }, &state, 0));
+  }
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_spin(executor, 3, nullptr, nullptr));
+  EXPECT_EQ(3u, state.starts.size());
+  EXPECT_EQ(3u, state.indices.size());
+}
+
+TEST_F(Core, external_pending_removal_and_late_notification_are_safe)
+{
+  int calls = 0;
+  uint64_t source;
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_add_source(executor,
+    [](void * data) {++*static_cast<int *>(data);}, &calls, 0, &source));
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_notify(executor, source, 2));
+  rcl_executor_item_t item;
+  ASSERT_EQ(RCL_EXECUTOR_READY, rcl_executor_next(executor, &item));
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_remove(executor, source));
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_notify(executor, source, 1));
+  item.function(item.context);
+  EXPECT_EQ(1, calls);
+  EXPECT_EQ(RCL_RET_OK, rcl_executor_complete(executor, item.token));
+  EXPECT_EQ(RCL_EXECUTOR_TIMEOUT, rcl_executor_next(executor, &item));
+}
+
+TEST_F(Core, partition_refuses_reentrant_groups)
+{
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_set_partitioned(executor, true));
+  auto source = add();
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_notify(executor, source, 1));
+  rcl_executor_item_t item;
+  EXPECT_EQ(RCL_EXECUTOR_TIMEOUT, rcl_executor_next(executor, &item));
+  EXPECT_NE(RCL_RET_OK, rcl_executor_add_group(executor, 1, RCL_EXECUTOR_REENTRANT));
+  EXPECT_NE(std::string::npos, std::string(rcl_get_error_string().str).find("Reentrant"));
+  rcl_reset_error();
+}
+
+TEST_F(Core, removed_partition_exits_without_delaying_new_groups)
+{
+  using namespace std::chrono_literals;
+  struct Exit
+  {
+    std::promise<void> * ended;
+    ~Exit() {if (ended) {ended->set_value();}}
+  };
+  struct State
+  {
+    std::promise<void> entered, release, ended, added;
+    std::shared_future<void> released = release.get_future().share();
+  } state;
+  auto entered = state.entered.get_future();
+  auto ended = state.ended.get_future();
+  auto added = state.added.get_future();
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_set_partitioned(executor, true));
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_set_thread_start(executor,
+    [](size_t, uint64_t group, void * data) {
+      thread_local std::unique_ptr<Exit> exit;
+      if (group == 1) {
+        exit = std::make_unique<Exit>(Exit{nullptr});
+        exit->ended = &static_cast<State *>(data)->ended;
+      }
+    }, &state));
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_add_group(executor, 1, RCL_EXECUTOR_MUTUALLY_EXCLUSIVE));
+  uint64_t first;
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_add_source(executor, [](void * data) {
+      auto & s = *static_cast<State *>(data);
+      s.entered.set_value();
+      s.released.wait();
+    }, &state, 1, &first));
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_notify(executor, first, 1));
+  std::thread spin([&] {EXPECT_EQ(RCL_RET_OK, rcl_executor_spin(executor, 1, nullptr, nullptr));});
+  EXPECT_EQ(std::future_status::ready, entered.wait_for(1s));
+  EXPECT_EQ(RCL_RET_OK, rcl_executor_remove(executor, first));
+  EXPECT_EQ(RCL_RET_OK, rcl_executor_remove_group(executor, 1));
+  EXPECT_EQ(RCL_RET_OK, rcl_executor_add_group(executor, 2, RCL_EXECUTOR_MUTUALLY_EXCLUSIVE));
+  uint64_t second;
+  EXPECT_EQ(RCL_RET_OK, rcl_executor_add_source(executor,
+    [](void * data) {static_cast<State *>(data)->added.set_value();}, &state, 2, &second));
+  EXPECT_EQ(RCL_RET_OK, rcl_executor_notify(executor, second, 1));
+  EXPECT_EQ(std::future_status::ready, added.wait_for(100ms));
+  state.release.set_value();
+  EXPECT_EQ(std::future_status::ready, ended.wait_for(1s));
+  rcl_executor_stop(handle);
+  spin.join();
+}
+
+TEST_F(Core, partition_defaults_to_wait_set_order)
+{
+  struct State
+  {
+    rcl_executor_handle_t * handle;
+    std::vector<int> sequence;
+  } state{handle, {}};
+  struct Source
+  {
+    State * state;
+    int value;
+  } first{&state, 0}, second{&state, 1};
+  auto dispatch = [](void * data) {
+      auto & source = *static_cast<Source *>(data);
+      source.state->sequence.push_back(source.value);
+      if (source.state->sequence.size() == 2) {rcl_executor_stop(source.state->handle);}
+    };
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_set_partitioned(executor, true));
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_add_group(executor, 1, RCL_EXECUTOR_MUTUALLY_EXCLUSIVE));
+  uint64_t a, b;
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_add_source(executor, dispatch, &first, 1, &a));
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_add_source(executor, dispatch, &second, 1, &b));
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_notify(executor, b, 1));
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_notify(executor, a, 1));
+  EXPECT_EQ(RCL_RET_OK, rcl_executor_spin(executor, 1, nullptr, nullptr));
+  EXPECT_EQ((std::vector<int>{0, 1}), state.sequence);
 }

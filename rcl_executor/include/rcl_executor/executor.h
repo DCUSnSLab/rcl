@@ -9,6 +9,7 @@
 #ifndef RCL_EXECUTOR__EXECUTOR_H_
 #define RCL_EXECUTOR__EXECUTOR_H_
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <rcl/timer.h>
@@ -47,7 +48,8 @@ typedef enum rcl_executor_entity_type_e
   RCL_EXECUTOR_GUARD_CONDITION,
   RCL_EXECUTOR_WORK,
   // Waitables that advance their own timers in take_data() register observers.
-  RCL_EXECUTOR_TIMER_OBSERVER
+  RCL_EXECUTOR_TIMER_OBSERVER,
+  RCL_EXECUTOR_WAITABLE
 } rcl_executor_entity_type_t;
 
 typedef enum rcl_executor_selection_policy_e
@@ -73,6 +75,21 @@ typedef enum rcl_executor_result_e
 } rcl_executor_result_t;
 
 typedef void (*rcl_executor_work_fn)(void * context);
+typedef void (*rcl_executor_thread_start_fn)(size_t index, uint64_t group, void * context);
+
+// Configure before spinning. Group zero identifies an unpartitioned or internal worker.
+RCL_EXECUTOR_PUBLIC
+rcl_ret_t rcl_executor_set_thread_start(
+  rcl_executor_t * executor, rcl_executor_thread_start_fn callback, void * context);
+RCL_EXECUTOR_PUBLIC
+rcl_ret_t rcl_executor_set_partitioned(rcl_executor_t * executor, bool partitioned);
+RCL_EXECUTOR_PUBLIC
+rcl_ret_t rcl_executor_remove_group(rcl_executor_t * executor, uint64_t group);
+// Removal cancels pending notifications; an already claimed dispatch still completes.
+RCL_EXECUTOR_PUBLIC
+rcl_ret_t rcl_executor_add_source(
+  rcl_executor_t * executor, rcl_executor_work_fn dispatch, void * context,
+  uint64_t group, rcl_executor_id_t * registration);
 
 typedef struct rcl_executor_item_s
 {
