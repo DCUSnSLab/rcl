@@ -847,6 +847,7 @@ rcl_subscription_can_loan_messages(const rcl_subscription_t * subscription)
     return false;  // error message already set
   }
 
+  // Broker deliveries retain immutable owners rather than mutable middleware loans.
   if (subscription->impl->ipc || subscription->impl->options.disable_loaned_message) {
     return false;
   }
