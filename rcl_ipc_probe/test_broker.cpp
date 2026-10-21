@@ -267,6 +267,50 @@ TEST_F(BrokerTest, SerializedCacheIsLazyAndShared)
   EXPECT_EQ(0, rcl_subscription_fini(&first, &node));
   EXPECT_EQ(0, rcl_subscription_fini(&second, &node));
 }
+TEST_F(BrokerTest, SerializedPoolReusesOnlyReleasedPublications)
+{
+  auto raw = rcl_get_zero_initialized_subscription();
+  auto options = rcl_subscription_get_default_options();
+  ASSERT_EQ(0, rcl_subscription_init(&raw, &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Image), "/broker_test", &options));
+  std::vector<const uint8_t *> buffers;
+  auto patch = mocking_utils::patch("lib:rcl", rmw_serialize,
+      [&](const void * message, const rosidl_message_type_support_t *,
+      rmw_serialized_message_t * output) {
+        if (output->buffer_capacity < 4096) {
+          auto ret = rmw_serialized_message_resize(output, 4096);
+          if (ret != RMW_RET_OK) {return ret;}
+        }
+        buffers.push_back(output->buffer);
+        std::memset(output->buffer,
+          static_cast<const sensor_msgs__msg__Image *>(message)->height, 4096);
+        output->buffer_length = 4096;
+        return RMW_RET_OK;
+      });
+  auto bytes = rmw_get_zero_initialized_serialized_message();
+  auto allocator = rcutils_get_default_allocator();
+  ASSERT_EQ(0, rmw_serialized_message_init(&bytes, 0, &allocator));
+  rcl_ipc_message_t * owners[3]{};
+  const void * data[3]{};
+  for (uint32_t i = 0; i < 3; ++i) {
+    send(i + 1);
+    ASSERT_EQ(0, rcl_take_ipc_message(&subscription, &owners[i], &data[i], nullptr));
+    ASSERT_EQ(0, rcl_take_serialized_message(&raw, &bytes, nullptr, nullptr));
+    EXPECT_EQ(i + 1, bytes.buffer[0]);
+    if (i == 1) {
+      rcl_ipc_message_release(owners[i]);
+      owners[i] = nullptr;
+    }
+  }
+  ASSERT_EQ(3u, buffers.size());
+  EXPECT_NE(buffers[0], buffers[1]);
+  EXPECT_EQ(buffers[1], buffers[2]);
+  EXPECT_EQ(1u, static_cast<const sensor_msgs__msg__Image *>(data[0])->height);
+  rcl_ipc_message_release(owners[0]);
+  rcl_ipc_message_release(owners[2]);
+  EXPECT_EQ(0, rmw_serialized_message_fini(&bytes));
+  EXPECT_EQ(0, rcl_subscription_fini(&raw, &node));
+}
 TEST_F(BrokerTest, SerializedPublisherPreservesWireBytesAndTypedCursor)
 {
   rcl_subscription_set_serialized_ipc(&subscription);

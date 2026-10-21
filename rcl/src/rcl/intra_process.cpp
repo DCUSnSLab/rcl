@@ -331,6 +331,28 @@ struct Serialized
   }
   ~Serialized() {rmw_serialized_message_fini(&value);}
 };
+struct SerializedPool
+{
+  std::mutex mutex;
+  std::unique_ptr<Serialized> cached;
+};
+std::shared_ptr<Serialized> acquire_serialized(const std::shared_ptr<SerializedPool> & pool)
+{
+  std::unique_ptr<Serialized> value;
+  {
+    std::lock_guard<std::mutex> lock(pool->mutex);
+    value = std::move(pool->cached);
+  }
+  if (!value) {value = std::make_unique<Serialized>();}
+  value->value.buffer_length = 0;
+  return std::shared_ptr<Serialized>(value.release(), [pool](Serialized * returned) {
+             std::unique_ptr<Serialized> retired(returned);
+             {
+               std::lock_guard<std::mutex> lock(pool->mutex);
+               if (!pool->cached) {pool->cached = std::move(retired);}
+             }
+    });
+}
 // Representations are cached by their first taker, off the publisher's thread.
 struct ConversionFailure {rcl_ret_t status;};
 struct Publication
@@ -340,6 +362,7 @@ struct Publication
   std::mutex mutex;
   std::shared_ptr<void> converted;
   std::mutex serialized_mutex;
+  std::shared_ptr<SerializedPool> serialized_pool;
   std::shared_ptr<Serialized> serialized;
   bool encoded_source = false;
   std::once_flag decode_once;
@@ -349,7 +372,8 @@ struct Publication
   {
     std::lock_guard<std::mutex> lock(serialized_mutex);
     if (!serialization_attempted) {
-      auto result = std::make_shared<Serialized>();
+      auto result = serialized_pool ? acquire_serialized(serialized_pool) :
+        std::make_shared<Serialized>();
       serialization_status = rcl_convert_rmw_ret_to_rcl_ret(
         rmw_serialize(source.get(), type->support, &result->value));
       serialization_attempted = true;
@@ -370,7 +394,7 @@ struct Publication
           if (!data) {throw std::bad_alloc();}
           type->init(data);
           auto owner = std::shared_ptr<void>(data, [type = type](void * p) {
-              type->fini(p); std::free(p);
+            type->fini(p); std::free(p);
             });
           auto ret = rcl_convert_rmw_ret_to_rcl_ret(
             rmw_deserialize(&serialized->value, type->support, data));
@@ -449,6 +473,7 @@ struct Publisher
   rosidl_type_hash_t hash;
   rmw_qos_profile_t qos;
   std::shared_ptr<Schema> type;
+  std::shared_ptr<SerializedPool> serialized_pool = std::make_shared<SerializedPool>();
   std::mutex module_mutex;
   void (* release)(void *) = nullptr;
   std::shared_ptr<void> module;
@@ -524,6 +549,7 @@ rmw_ret_t prepare(
       if (!shared) {
         shared = publication(publishing_owner.get() == message ? publishing_owner :
             clone_message(*pub->type, message, *pub->type), pub->type);
+        shared->serialized_pool = pub->serialized_pool;
       }
       auto metadata = *info;
       metadata.from_intra_process = true;
@@ -563,37 +589,37 @@ rmw_ret_t prepare(
 }  // namespace
 namespace rcl_ipc
 {
-struct Type {std::shared_ptr<Schema> schema;};
-std::shared_ptr<Type> service_type(const rosidl_service_type_support_t * support, bool response)
-{
-  bool cpp = std::strstr(support->typesupport_identifier, "cpp") != nullptr;
-  auto id = cpp ? "rosidl_typesupport_introspection_cpp" : "rosidl_typesupport_introspection_c";
-  auto introspection = support->func(support, id);
-  if (!introspection) {rcl_reset_error(); return {};}
-  const void * members;
-  if (cpp) {
-    auto service = static_cast<const rosidl_typesupport_introspection_cpp::ServiceMembers *>(
-      introspection->data);
-    members = response ? service->response_members_ : service->request_members_;
-  } else {
-    auto service = static_cast<const rosidl_typesupport_introspection_c__ServiceMembers *>(
-      introspection->data);
-    members = response ? service->response_members_ : service->request_members_;
+  struct Type {std::shared_ptr<Schema> schema;};
+  std::shared_ptr<Type> service_type(const rosidl_service_type_support_t * support, bool response)
+  {
+    bool cpp = std::strstr(support->typesupport_identifier, "cpp") != nullptr;
+    auto id = cpp ? "rosidl_typesupport_introspection_cpp" : "rosidl_typesupport_introspection_c";
+    auto introspection = support->func(support, id);
+    if (!introspection) {rcl_reset_error(); return {};}
+    const void * members;
+    if (cpp) {
+      auto service = static_cast<const rosidl_typesupport_introspection_cpp::ServiceMembers *>(
+        introspection->data);
+      members = response ? service->response_members_ : service->request_members_;
+    } else {
+      auto service = static_cast<const rosidl_typesupport_introspection_c__ServiceMembers *>(
+        introspection->data);
+      members = response ? service->response_members_ : service->request_members_;
+    }
+    auto library = pin(introspection->data);
+    if (!library) {return {};}
+    auto result = std::make_shared<Type>();
+    result->schema = std::make_shared<Schema>(Schema{cpp, members, library, nullptr, pin(support)});
+    return result;
   }
-  auto library = pin(introspection->data);
-  if (!library) {return {};}
-  auto result = std::make_shared<Type>();
-  result->schema = std::make_shared<Schema>(Schema{cpp, members, library, nullptr, pin(support)});
-  return result;
-}
-std::shared_ptr<void> clone(const Type & source, const void * data, const Type & target)
-{
-  return clone_message(*source.schema, data, *target.schema);
-}
-void copy(const Type & source, const void * data, const Type & target, void * output)
-{
-  ::copy(*source.schema, data, *target.schema, output);
-}
+  std::shared_ptr<void> clone(const Type & source, const void * data, const Type & target)
+  {
+    return clone_message(*source.schema, data, *target.schema);
+  }
+  void copy(const Type & source, const void * data, const Type & target, void * output)
+  {
+    ::copy(*source.schema, data, *target.schema, output);
+  }
 }  // namespace rcl_ipc
 struct rcl_ipc_message_s {Sample sample;};
 
@@ -701,7 +727,7 @@ void rcl_ipc_subscription_init(
             if (!data) {return {0, nullptr, nullptr};}
             sub->type->init(data);
             auto owner = std::shared_ptr<void>(data, [type = sub->type](void * p) {
-                type->fini(p); std::free(p);
+              type->fini(p); std::free(p);
               });
             if (!decode(input, data)) {return {0, nullptr, nullptr};}
             shared = publication(owner, sub->type);
