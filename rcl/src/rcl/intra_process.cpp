@@ -372,6 +372,11 @@ void take_message(const Schema & schema, void * data, void * output)
   std::swap_ranges(static_cast<char *>(data), static_cast<char *>(data) + schema.size(),
     static_cast<char *>(output));
 }
+bool same_allocator(const rcutils_allocator_t & a, const rcutils_allocator_t & b)
+{
+  return a.allocate == b.allocate && a.deallocate == b.deallocate &&
+         a.reallocate == b.reallocate && a.zero_allocate == b.zero_allocate && a.state == b.state;
+}
 struct SerializedPool
 {
   std::mutex mutex;
@@ -922,6 +927,16 @@ rcl_ret_t rcl_ipc_take_serialized_copy(
     std::shared_ptr<Serialized> bytes;
     auto ret = sample.owner->bytes(bytes);
     if (ret != RCL_RET_OK) {return ret;}
+    // Ingress bytes were copied for this publication alone, so the last reader takes the buffer.
+    if (sample.owner->encoded_source && sample.owner.use_count() == 1 &&
+      same_allocator(output->allocator, bytes->value.allocator))
+    {
+      std::swap(output->buffer, bytes->value.buffer);
+      std::swap(output->buffer_length, bytes->value.buffer_length);
+      std::swap(output->buffer_capacity, bytes->value.buffer_capacity);
+      if (info) {*info = sample.info;}
+      return RCL_RET_OK;
+    }
     auto size = bytes->value.buffer_length;
     if (output->buffer_capacity < size) {
       ret = rcl_convert_rmw_ret_to_rcl_ret(rmw_serialized_message_resize(output, size));
