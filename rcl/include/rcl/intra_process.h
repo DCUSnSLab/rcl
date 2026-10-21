@@ -23,6 +23,16 @@ typedef struct rcl_ipc_message_s rcl_ipc_message_t;
 RCL_PUBLIC rcl_ret_t rcl_publish_ipc_owned(
   const rcl_publisher_t * publisher,
   const void * data, void (*release)(void *), void * owner);
+/// Publish an owner that holds data, an initialized ROS message that fill(owner) completes.
+/**
+ * Broker readers that pass the same key to rcl_take_ipc_adapted read the owner and fill never
+ * runs for them; fill runs once, on the publishing thread when the rmw serializes data for
+ * remote readers, otherwise for the first reader of the ROS form. fill returns false on failure.
+ * Without the broker, data is filled and published at once. Consumes owner on every return path.
+ */
+RCL_PUBLIC rcl_ret_t rcl_publish_ipc_adapted(
+  const rcl_publisher_t * publisher, void * data, const char * key,
+  bool (*fill)(void *), void (*release)(void *), void * owner);
 RCL_PUBLIC void rcl_publisher_disable_ipc(rcl_publisher_t * publisher);
 RCL_PUBLIC bool rcl_publisher_is_ipc_enabled(const rcl_publisher_t * publisher);
 RCL_PUBLIC bool rcl_subscription_is_ipc_enabled(const rcl_subscription_t * subscription);
@@ -31,6 +41,11 @@ RCL_PUBLIC rcl_ret_t rcl_take_ipc_message(
   const rcl_subscription_t * subscription,
   rcl_ipc_message_t ** message, const void ** data, rmw_message_info_t * info);
 RCL_PUBLIC void rcl_ipc_message_release(rcl_ipc_message_t * message);
+/// rcl_take_ipc_message that sets *adapted, and not *data, for a publication with this key.
+RCL_PUBLIC rcl_ret_t rcl_take_ipc_adapted(
+  const rcl_subscription_t * subscription, const char * key,
+  rcl_ipc_message_t ** message, const void ** adapted, const void ** data,
+  rmw_message_info_t * info);
 RCL_PUBLIC void rcl_subscription_disable_ipc(rcl_subscription_t * subscription);
 /// Preserve encoded ingress for generic and raw subscriptions without changing their cursor.
 RCL_PUBLIC void rcl_subscription_set_serialized_ipc(rcl_subscription_t * subscription);

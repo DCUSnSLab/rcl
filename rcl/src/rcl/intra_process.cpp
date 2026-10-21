@@ -414,9 +414,25 @@ struct Publication
   std::once_flag decode_once;
   bool serialization_attempted = false;
   rcl_ret_t serialization_status = RCL_RET_OK;
+  // An adapted publication: source is completed by fill(adapted) for the first reader of the ROS
+  // form, and readers that know key read adapted directly.
+  bool (* fill)(void *) = nullptr;
+  void * adapted = nullptr;
+  std::string key;
+  std::once_flag fill_once;
+  bool fill_ok = true;
+  bool filled()
+  {
+    if (fill) {std::call_once(fill_once, [this] {fill_ok = fill(adapted);});}
+    return fill_ok;
+  }
   rcl_ret_t bytes(std::shared_ptr<Serialized> & output)
   {
     std::lock_guard<std::mutex> lock(serialized_mutex);
+    if (!filled()) {
+      RCL_SET_ERROR_MSG("converting an adapted intra-process message failed");
+      return RCL_RET_ERROR;
+    }
     if (!serialization_attempted) {
       auto result = serialized_pool ? acquire_serialized(serialized_pool) :
         std::make_shared<Serialized>();
@@ -450,6 +466,10 @@ struct Publication
           }
           source = std::move(owner);
         });
+    }
+    if (!filled()) {
+      RCL_SET_ERROR_MSG("converting an adapted intra-process message failed");
+      throw ConversionFailure{RCL_RET_ERROR};
     }
     if (target.cpp == type->cpp) {return source.get();}
     std::lock_guard<std::mutex> lock(mutex);
@@ -564,13 +584,20 @@ struct Prepared
   std::vector<Sample> retired;
 };
 thread_local std::shared_ptr<void> publishing_owner;
+struct Adapted
+{
+  bool (* fill)(void *) = nullptr;
+  void * owner = nullptr;
+  const char * key = nullptr;
+};
+thread_local Adapted publishing_adapted;
 rmw_ret_t prepare(
   void * user, const void * message, const rmw_message_info_t * info,
   const uint8_t * matched, size_t count, rmw_ipc_route_t * route)
 {
   auto & state = *static_cast<Prepared *>(user);
   auto pub = state.pub;
-  std::lock_guard<std::mutex> lock(pub->broker->mutex);
+  std::unique_lock<std::mutex> lock(pub->broker->mutex);
   try {
     std::shared_ptr<Publication> shared;
     std::vector<std::pair<std::shared_ptr<Subscription>, Sample>> pending;
@@ -596,6 +623,11 @@ rmw_ret_t prepare(
         shared = publication(publishing_owner.get() == message ? publishing_owner :
             clone_message(*pub->type, message, *pub->type), pub->type);
         shared->serialized_pool = pub->serialized_pool;
+        if (publishing_adapted.fill && publishing_owner.get() == message) {
+          shared->fill = publishing_adapted.fill;
+          shared->adapted = publishing_adapted.owner;
+          shared->key = publishing_adapted.key;
+        }
       }
       auto metadata = *info;
       metadata.from_intra_process = true;
@@ -626,6 +658,22 @@ rmw_ret_t prepare(
     }
     route->excluded_gids = state.excluded.empty() ? nullptr : state.excluded.front().data();
     route->excluded_count = state.excluded.size();
+    if (publishing_adapted.fill && publishing_owner.get() == message) {
+      // The rmw serializes the message unless every matched reader was routed here.
+      bool covered = true;
+      for (size_t i = 0; i < count && covered; ++i) {
+        covered = std::any_of(state.excluded.begin(), state.excluded.end(), [&](const Gid & id) {
+              return std::memcmp(id.data(), matched + i * id.size(), id.size()) == 0;
+            });
+      }
+      lock.unlock();
+      bool ok = covered || (shared ? shared->filled() :
+        publishing_adapted.fill(publishing_adapted.owner));
+      if (!ok) {
+        RCL_SET_ERROR_MSG("converting an adapted message failed");
+        return RMW_RET_ERROR;
+      }
+    }
     return RMW_RET_OK;
   } catch (const std::bad_alloc &) {
     RCL_SET_ERROR_MSG("allocating intra-process delivery failed");
@@ -910,6 +958,45 @@ rcl_ret_t rcl_take_ipc_message(
     return RCL_RET_BAD_ALLOC;
   }
 }
+rcl_ret_t rcl_take_ipc_adapted(
+  const rcl_subscription_t * subscription, const char * key,
+  rcl_ipc_message_t ** message, const void ** adapted, const void ** data,
+  rmw_message_info_t * info)
+{
+  if (!message || !adapted || !data || !key) {
+    RCL_SET_ERROR_MSG("key, message, adapted and data are required");
+    return RCL_RET_INVALID_ARGUMENT;
+  }
+  try {
+    if (!rcl_subscription_is_ipc_enabled(subscription)) {return RCL_RET_SUBSCRIPTION_TAKE_FAILED;}
+    auto sub = *static_cast<std::shared_ptr<Subscription> *>(subscription->impl->ipc);
+    auto result = std::make_unique<rcl_ipc_message_t>();
+    Sample sample;
+    {
+      std::lock_guard<std::mutex> lock(sub->mutex);
+      if (sub->queue.empty()) {return RCL_RET_SUBSCRIPTION_TAKE_FAILED;}
+      sample = std::move(sub->queue.front());
+      sub->queue.erase(sub->queue.begin());
+      sub->ready.store(sub->queue.size(), std::memory_order_release);
+    }
+    if (sample.owner->fill && sample.owner->key == key) {
+      *adapted = sample.owner->adapted;
+      *data = nullptr;
+    } else {
+      *adapted = nullptr;
+      *data = sample.owner->get(*sub->type);
+    }
+    if (info) {*info = sample.info;}
+    result->owner = std::move(sample.owner);
+    *message = result.release();
+    return RCL_RET_OK;
+  } catch (const ConversionFailure & error) {
+    return error.status;
+  } catch (const std::bad_alloc &) {
+    RCL_SET_ERROR_MSG("allocating retained message failed");
+    return RCL_RET_BAD_ALLOC;
+  }
+}
 rcl_ret_t rcl_ipc_take_serialized_copy(
   const rcl_subscription_t * subscription, rcl_serialized_message_t * output,
   rmw_message_info_t * info)
@@ -974,6 +1061,25 @@ rcl_ret_t rcl_ipc_take_copy(
   }
 }
 
+rcl_ret_t rcl_publish_ipc_adapted(
+  const rcl_publisher_t * publisher, void * data, const char * key,
+  bool (*fill)(void *), void (*release)(void *), void * owner)
+{
+  std::unique_ptr<void, decltype(release)> consumed(owner, release);
+  if (!rcl_publisher_is_ipc_enabled(publisher)) {
+    if (!fill(owner)) {
+      RCL_SET_ERROR_MSG("converting an adapted message failed");
+      return RCL_RET_ERROR;
+    }
+    return rcl_publish(publisher, data, nullptr);
+  }
+  struct Scope
+  {
+    Adapted previous;
+    ~Scope() {publishing_adapted = previous;}
+  } scope{std::exchange(publishing_adapted, Adapted{fill, owner, key})};
+  return rcl_publish_ipc_owned(publisher, data, release, consumed.release());
+}
 void rcl_publisher_disable_ipc(rcl_publisher_t * publisher) {rcl_ipc_publisher_fini(publisher);}
 rcl_ret_t rcl_publish_ipc_owned(
   const rcl_publisher_t * publisher,

@@ -589,4 +589,149 @@ TEST_F(BrokerTest, CommonExecutorBacklogAndDepthCredits)
   rcl_executor_destroy(executor);
   sensor_msgs__msg__Image__destroy(result);
 }
+struct AdaptedOwner
+{
+  sensor_msgs__msg__Image * message = sensor_msgs__msg__Image__create();
+  uint32_t custom = 0;
+  bool fail = false;
+  std::atomic<int> * fills;
+  std::atomic<int> * releases;
+};
+bool fill_adapted(void * value)
+{
+  auto owner = static_cast<AdaptedOwner *>(value);
+  ++*owner->fills;
+  owner->message->height = owner->custom;
+  return !owner->fail;
+}
+void release_adapted(void * value)
+{
+  auto owner = static_cast<AdaptedOwner *>(value);
+  ++*owner->releases;
+  sensor_msgs__msg__Image__destroy(owner->message);
+  delete owner;
+}
+TEST_F(BrokerTest, AdaptedPublicationFillsOnlyForROSReaders)
+{
+  auto keyed = rcl_get_zero_initialized_subscription();
+  auto options = rcl_subscription_get_default_options();
+  ASSERT_EQ(0, rcl_subscription_init(&keyed, &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Image), "/broker_test", &options));
+  std::atomic<int> fills{0};
+  std::atomic<int> releases{0};
+  auto publish = [&](uint32_t custom, bool fail) {
+      auto owner = new AdaptedOwner{};
+      owner->custom = custom;
+      owner->fail = fail;
+      owner->fills = &fills;
+      owner->releases = &releases;
+      return rcl_publish_ipc_adapted(&publisher, owner->message, "adapted",
+               fill_adapted, release_adapted, owner);
+    };
+  ASSERT_EQ(0, publish(5, false));
+  EXPECT_EQ(0, fills.load());
+  rcl_ipc_message_t * message = nullptr;
+  const void * adapted = nullptr;
+  const void * data = nullptr;
+  ASSERT_EQ(0, rcl_take_ipc_adapted(&keyed, "adapted", &message, &adapted, &data, nullptr));
+  ASSERT_NE(nullptr, adapted);
+  EXPECT_EQ(nullptr, data);
+  EXPECT_EQ(5u, static_cast<const AdaptedOwner *>(adapted)->custom);
+  EXPECT_EQ(0, fills.load());
+  rcl_ipc_message_release(message);
+  EXPECT_EQ(0, releases.load());
+  ASSERT_EQ(0, rcl_take_ipc_message(&subscription, &message, &data, nullptr));
+  EXPECT_EQ(5u, static_cast<const sensor_msgs__msg__Image *>(data)->height);
+  EXPECT_EQ(1, fills.load());
+  rcl_ipc_message_release(message);
+  EXPECT_EQ(1, releases.load());
+
+  ASSERT_EQ(0, publish(6, false));
+  ASSERT_EQ(0, rcl_take_ipc_adapted(&keyed, "other", &message, &adapted, &data, nullptr));
+  EXPECT_EQ(nullptr, adapted);
+  EXPECT_EQ(6u, static_cast<const sensor_msgs__msg__Image *>(data)->height);
+  rcl_ipc_message_release(message);
+  auto copy = sensor_msgs__msg__Image__create();
+  ASSERT_EQ(0, rcl_take(&subscription, copy, nullptr, nullptr));
+  EXPECT_EQ(6u, copy->height);
+  sensor_msgs__msg__Image__destroy(copy);
+  EXPECT_EQ(2, fills.load());
+  EXPECT_EQ(2, releases.load());
+
+  ASSERT_EQ(0, publish(7, true));
+  EXPECT_EQ(RCL_RET_ERROR, rcl_take_ipc_message(&subscription, &message, &data, nullptr));
+  rcl_reset_error();
+  ASSERT_EQ(0, rcl_take_ipc_adapted(&keyed, "adapted", &message, &adapted, &data, nullptr));
+  EXPECT_EQ(7u, static_cast<const AdaptedOwner *>(adapted)->custom);
+  rcl_ipc_message_release(message);
+  EXPECT_EQ(3, fills.load());
+  EXPECT_EQ(3, releases.load());
+
+  ASSERT_EQ(0, rcl_subscription_fini(&keyed, &node));
+  ASSERT_EQ(0, rcl_subscription_fini(&subscription, &node));
+  ASSERT_EQ(0, publish(8, false));
+  EXPECT_EQ(3, fills.load());
+  EXPECT_EQ(4, releases.load());
+}
+TEST_F(BrokerTest, AdaptedPublicationFillsBeforeRemoteDelivery)
+{
+  auto other = rcl_get_zero_initialized_context();
+  auto options = rcl_get_zero_initialized_init_options();
+  ASSERT_EQ(0, rcl_init_options_init(&options, rcl_get_default_allocator()));
+  ASSERT_EQ(0, rcl_init(0, nullptr, &options, &other));
+  ASSERT_EQ(0, rcl_init_options_fini(&options));
+  auto other_node = rcl_get_zero_initialized_node();
+  auto no = rcl_node_get_default_options();
+  no.enable_rosout = false;
+  ASSERT_EQ(0, rcl_node_init(&other_node, "other_context", "/", &other, &no));
+  auto sub = rcl_get_zero_initialized_subscription();
+  auto so = rcl_subscription_get_default_options();
+  ASSERT_EQ(0, rcl_subscription_init(&sub, &other_node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Image), "/broker_test", &so));
+  size_t matches = 0;
+  for (int i = 0; i < 200 && matches < 2; ++i) {
+    ASSERT_EQ(0, rcl_publisher_get_subscription_count(&publisher, &matches));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_EQ(2u, matches);
+  std::atomic<int> fills{0};
+  std::atomic<int> releases{0};
+  auto owner = new AdaptedOwner{};
+  owner->custom = 23;
+  owner->fills = &fills;
+  owner->releases = &releases;
+  ASSERT_EQ(0, rcl_publish_ipc_adapted(&publisher, owner->message, "adapted",
+      fill_adapted, release_adapted, owner));
+  EXPECT_EQ(1, fills.load());
+  auto message = sensor_msgs__msg__Image__create();
+  rcl_ret_t result = RCL_RET_SUBSCRIPTION_TAKE_FAILED;
+  for (int i = 0; i < 200 && result != RCL_RET_OK; ++i) {
+    result = rcl_take(&sub, message, nullptr, nullptr);
+    if (result != RCL_RET_OK) {std::this_thread::sleep_for(std::chrono::milliseconds(1));}
+  }
+  EXPECT_EQ(0, result);
+  EXPECT_EQ(23u, message->height);
+  ASSERT_EQ(0, rcl_take(&subscription, message, nullptr, nullptr));
+  EXPECT_EQ(23u, message->height);
+  EXPECT_EQ(1, fills.load());
+  sensor_msgs__msg__Image__destroy(message);
+  EXPECT_EQ(0, rcl_subscription_fini(&sub, &other_node));
+  EXPECT_EQ(0, rcl_node_fini(&other_node));
+  EXPECT_EQ(0, rcl_shutdown(&other));
+  EXPECT_EQ(0, rcl_context_fini(&other));
+}
+TEST_F(BrokerTest, AdaptedPublicationWithoutBrokerFillsAtOnce)
+{
+  rcl_publisher_disable_ipc(&publisher);
+  std::atomic<int> fills{0};
+  std::atomic<int> releases{0};
+  auto owner = new AdaptedOwner{};
+  owner->custom = 9;
+  owner->fills = &fills;
+  owner->releases = &releases;
+  ASSERT_EQ(0, rcl_publish_ipc_adapted(&publisher, owner->message, "adapted",
+      fill_adapted, release_adapted, owner));
+  EXPECT_EQ(1, fills.load());
+  EXPECT_EQ(1, releases.load());
+}
 }  // namespace
