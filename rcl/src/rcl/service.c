@@ -38,10 +38,12 @@ extern "C"
 #include "rosidl_runtime_c/service_type_support_struct.h"
 
 #include "./common.h"
+#include "./intra_process_service.h"
 #include "./service_event_publisher.h"
 
 struct rcl_service_impl_s
 {
+  void * ipc;
   rcl_service_options_t options;
   rmw_qos_profile_t actual_request_subscription_qos;
   rmw_qos_profile_t actual_response_publisher_qos;
@@ -201,6 +203,8 @@ rcl_service_init(
   }
   service->impl->type_hash = *type_support->get_type_hash_func(type_support);
 
+  service->impl->ipc = rcl_ipc_service_init(service, node, type_support);
+
   RCUTILS_LOG_DEBUG_NAMED(ROS_PACKAGE_NAME, "Service initialized");
   TRACETOOLS_TRACEPOINT(
     rcl_service_init,
@@ -257,6 +261,7 @@ rcl_service_fini(rcl_service_t * service, rcl_node_t * node)
       result = rcl_ret;
     }
 
+    rcl_ipc_service_fini(service->impl->ipc);
     rmw_ret_t ret = rmw_destroy_service(rmw_node, service->impl->rmw_handle);
     if (ret != RMW_RET_OK) {
       RCL_SET_ERROR_MSG(rmw_get_error_string().str);
@@ -337,8 +342,9 @@ rcl_take_request_with_info(
   RCL_CHECK_FOR_NULL_WITH_MSG(options, "Failed to get service options", return RCL_RET_ERROR);
 
   bool taken = false;
-  rmw_ret_t ret = rmw_take_request(
-    service->impl->rmw_handle, request_header, ros_request, &taken);
+  rmw_ret_t ret = service->impl->ipc ?
+    rcl_ipc_take_request(service->impl->ipc, request_header, ros_request, &taken) :
+    rmw_take_request(service->impl->rmw_handle, request_header, ros_request, &taken);
   if (RMW_RET_OK != ret) {
     RCL_SET_ERROR_MSG(rmw_get_error_string().str);
     if (RMW_RET_BAD_ALLOC == ret) {
@@ -395,7 +401,9 @@ rcl_send_response(
   const rcl_service_options_t * options = rcl_service_get_options(service);
   RCL_CHECK_FOR_NULL_WITH_MSG(options, "Failed to get service options", return RCL_RET_ERROR);
 
-  ret = rmw_send_response(service->impl->rmw_handle, request_header, ros_response);
+  ret = service->impl->ipc ?
+    rcl_ipc_send_response(service->impl->ipc, request_header, ros_response) :
+    rmw_send_response(service->impl->rmw_handle, request_header, ros_response);
   if (ret != RMW_RET_OK) {
     RCL_SET_ERROR_MSG(rmw_get_error_string().str);
     if (ret == RMW_RET_TIMEOUT) {

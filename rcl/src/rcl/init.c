@@ -40,6 +40,7 @@ extern "C"
 #include "./common.h"
 #include "./context_impl.h"
 #include "./intra_process_internal.h"
+#include "./intra_process_service.h"
 #include "./init_options_impl.h"
 
 static atomic_uint_least64_t __rcl_next_unique_id = ATOMIC_VAR_INIT(1);
@@ -314,6 +315,7 @@ rcl_init(
     goto fail;
   }
   rcl_ipc_context_init(context);
+  rcl_ipc_services_init(context);
 
   TRACETOOLS_TRACEPOINT(rcl_init, (const void *)context);
 

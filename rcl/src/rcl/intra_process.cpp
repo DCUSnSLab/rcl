@@ -30,8 +30,11 @@
 #include "rosidl_runtime_c/string_functions.h"
 #include "rosidl_runtime_c/u16string_functions.h"
 #include "rosidl_typesupport_introspection_c/message_introspection.h"
+#include "rosidl_typesupport_introspection_c/service_introspection.h"
 #include "rosidl_typesupport_introspection_cpp/message_introspection.hpp"
+#include "rosidl_typesupport_introspection_cpp/service_introspection.hpp"
 #include "./intra_process_internal.h"
+#include "./intra_process_message.hpp"
 #include "./context_impl.h"
 #include "./common.h"
 #include "./publisher_impl.h"
@@ -558,6 +561,40 @@ rmw_ret_t prepare(
   }
 }
 }  // namespace
+namespace rcl_ipc
+{
+struct Type {std::shared_ptr<Schema> schema;};
+std::shared_ptr<Type> service_type(const rosidl_service_type_support_t * support, bool response)
+{
+  bool cpp = std::strstr(support->typesupport_identifier, "cpp") != nullptr;
+  auto id = cpp ? "rosidl_typesupport_introspection_cpp" : "rosidl_typesupport_introspection_c";
+  auto introspection = support->func(support, id);
+  if (!introspection) {rcl_reset_error(); return {};}
+  const void * members;
+  if (cpp) {
+    auto service = static_cast<const rosidl_typesupport_introspection_cpp::ServiceMembers *>(
+      introspection->data);
+    members = response ? service->response_members_ : service->request_members_;
+  } else {
+    auto service = static_cast<const rosidl_typesupport_introspection_c__ServiceMembers *>(
+      introspection->data);
+    members = response ? service->response_members_ : service->request_members_;
+  }
+  auto library = pin(introspection->data);
+  if (!library) {return {};}
+  auto result = std::make_shared<Type>();
+  result->schema = std::make_shared<Schema>(Schema{cpp, members, library, nullptr, pin(support)});
+  return result;
+}
+std::shared_ptr<void> clone(const Type & source, const void * data, const Type & target)
+{
+  return clone_message(*source.schema, data, *target.schema);
+}
+void copy(const Type & source, const void * data, const Type & target, void * output)
+{
+  ::copy(*source.schema, data, *target.schema, output);
+}
+}  // namespace rcl_ipc
 struct rcl_ipc_message_s {Sample sample;};
 
 void rcl_ipc_context_init(rcl_context_t * context)

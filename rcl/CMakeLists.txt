@@ -54,6 +54,7 @@ set(${PROJECT_NAME}_sources
   src/rcl/guard_condition.c
   src/rcl/guard_condition_callback.cpp
   src/rcl/intra_process.cpp
+  src/rcl/intra_process_service.cpp
   src/rcl/ipc_prototype.cpp
   src/rcl/init.c
   src/rcl/init_options.c

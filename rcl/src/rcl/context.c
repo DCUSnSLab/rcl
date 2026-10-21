@@ -24,6 +24,7 @@ extern "C"
 #include "./common.h"
 #include "./context_impl.h"
 #include "./intra_process_internal.h"
+#include "./intra_process_service.h"
 #include "rcutils/stdatomic_helper.h"
 
 rcl_context_t
@@ -148,6 +149,7 @@ __cleanup_context(rcl_context_t * context)
     }
 
     rcl_ipc_context_fini(context);
+    rcl_ipc_services_fini(context);
     // clean up rmw_context
     if (NULL != context->impl->rmw_context.implementation_identifier) {
       rmw_ret_t rmw_context_fini_ret = rmw_context_fini(&(context->impl->rmw_context));

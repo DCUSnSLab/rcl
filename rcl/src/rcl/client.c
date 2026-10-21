@@ -38,10 +38,12 @@ extern "C"
 #include "rosidl_runtime_c/service_type_support_struct.h"
 
 #include "./common.h"
+#include "./intra_process_service.h"
 #include "./service_event_publisher.h"
 
 struct rcl_client_impl_s
 {
+  void * ipc;
   rcl_client_options_t options;
   rmw_qos_profile_t actual_request_publisher_qos;
   rmw_qos_profile_t actual_response_subscription_qos;
@@ -196,6 +198,8 @@ rcl_client_init(
   }
   client->impl->type_hash = *hash;
 
+  client->impl->ipc = rcl_ipc_client_init(client, node, type_support);
+
   RCUTILS_LOG_DEBUG_NAMED(ROS_PACKAGE_NAME, "Client initialized");
   TRACETOOLS_TRACEPOINT(
     rcl_client_init,
@@ -251,6 +255,7 @@ rcl_client_fini(rcl_client_t * client, rcl_node_t * node)
       result = rcl_ret;
     }
 
+    rcl_ipc_client_fini(client->impl->ipc);
     rmw_ret_t ret = rmw_destroy_client(rmw_node, client->impl->rmw_handle);
     if (ret != RMW_RET_OK) {
       RCL_SET_ERROR_MSG(rmw_get_error_string().str);
@@ -323,9 +328,10 @@ rcl_send_request(const rcl_client_t * client, const void * ros_request, int64_t 
   RCL_CHECK_ARGUMENT_FOR_NULL(ros_request, RCL_RET_INVALID_ARGUMENT);
   RCL_CHECK_ARGUMENT_FOR_NULL(sequence_number, RCL_RET_INVALID_ARGUMENT);
   *sequence_number = rcutils_atomic_load_int64_t(&client->impl->sequence_number);
-  if (rmw_send_request(
-      client->impl->rmw_handle, ros_request, sequence_number) != RMW_RET_OK)
-  {
+  rcl_ret_t send_ret = client->impl->ipc ?
+    rcl_ipc_send_request(client->impl->ipc, ros_request, sequence_number) :
+    rmw_send_request(client->impl->rmw_handle, ros_request, sequence_number);
+  if (send_ret != RMW_RET_OK) {
     RCL_SET_ERROR_MSG(rmw_get_error_string().str);
     return RCL_RET_ERROR;
   }
@@ -369,9 +375,10 @@ rcl_take_response_with_info(
   bool taken = false;
   request_header->source_timestamp = 0;
   request_header->received_timestamp = 0;
-  if (rmw_take_response(
-      client->impl->rmw_handle, request_header, ros_response, &taken) != RMW_RET_OK)
-  {
+  rcl_ret_t take_ret = client->impl->ipc ?
+    rcl_ipc_take_response(client->impl->ipc, request_header, ros_response, &taken) :
+    rmw_take_response(client->impl->rmw_handle, request_header, ros_response, &taken);
+  if (take_ret != RMW_RET_OK) {
     RCL_SET_ERROR_MSG(rmw_get_error_string().str);
     return RCL_RET_ERROR;
   }
