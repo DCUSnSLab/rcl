@@ -169,12 +169,12 @@ struct Clock
   void insert(Entry & entry);
   void erase(Entry & entry);
 
+  // Deadlines a jump moves are reported per timer, after rcl stores them (timer_changed).
+  // A jump still wakes the waiters to compare the deadlines against the new time.
   static void jump(const rcl_time_jump_t *, bool before, void * data)
   {
     if (!before) {
-      auto self = static_cast<Clock *>(data);
-      self->dirty.store(true, std::memory_order_release);
-      self->changed();
+      static_cast<Clock *>(data)->changed();
     }
   }
 
@@ -356,7 +356,7 @@ struct rcl_executor_s
     return count;
   }
 
-  static void reset_timer(const void * data, size_t)
+  static void timer_changed(const void * data, size_t)
   {
     auto entry = static_cast<const Entry *>(data);
     entry->clock->dirty.store(true, std::memory_order_release);
@@ -385,9 +385,13 @@ struct rcl_executor_s
           cb, data);
       case RCL_EXECUTOR_TIMER:
       case RCL_EXECUTOR_TIMER_OBSERVER:
-        return rcl_timer_set_on_reset_callback(
-          const_cast<rcl_timer_t *>(static_cast<const rcl_timer_t *>(e.entity)),
-          install ? reset_timer : nullptr, data);
+        {
+          auto timer = static_cast<const rcl_timer_t *>(e.entity);
+          auto changed = install ? timer_changed : nullptr;
+          auto result = rcl_timer_set_on_schedule_change_callback(timer, changed, data);
+          if (result != RCL_RET_OK) {return result;}
+          return rcl_timer_set_on_reset_callback(const_cast<rcl_timer_t *>(timer), changed, data);
+        }
       case RCL_EXECUTOR_WORK:
       case RCL_EXECUTOR_WAITABLE:
         return RCL_RET_OK;

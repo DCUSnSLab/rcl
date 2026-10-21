@@ -470,6 +470,79 @@ TEST_F(Core, partition_defaults_to_wait_set_order)
   EXPECT_EQ((std::vector<int>{0, 1}), state.sequence);
 }
 
+TEST_F(Core, timer_created_while_spinning_follows_a_backward_jump)
+{
+  using namespace std::chrono_literals;
+  constexpr int64_t second = 1000000000;
+  auto allocator = rcl_get_default_allocator();
+  auto options = rcl_get_zero_initialized_init_options();
+  ASSERT_EQ(RCL_RET_OK, rcl_init_options_init(&options, allocator));
+  auto context = rcl_get_zero_initialized_context();
+  ASSERT_EQ(RCL_RET_OK, rcl_init(0, nullptr, &options, &context));
+  rcl_clock_t clock;
+  ASSERT_EQ(RCL_RET_OK, rcl_clock_init(RCL_ROS_TIME, &clock, &allocator));
+  ASSERT_EQ(RCL_RET_OK, rcl_enable_ros_time_override(&clock));
+  ASSERT_EQ(RCL_RET_OK, rcl_set_ros_time_override(&clock, 1000 * second));
+  struct State
+  {
+    rcl_clock_t * clock;
+    std::mutex mutex;
+    std::unordered_map<const void *, std::vector<int64_t>> calls;
+  } state{&clock, {}, {}};
+  auto first = rcl_get_zero_initialized_timer();
+  ASSERT_EQ(RCL_RET_OK,
+    rcl_timer_init2(&first, &clock, &context, second / 10, nullptr, allocator, true));
+  uint64_t first_id, second_id;
+  ASSERT_EQ(RCL_RET_OK,
+    rcl_executor_add(executor, RCL_EXECUTOR_TIMER, &first, nullptr, 0, &first_id));
+  std::thread spin([&] {
+      EXPECT_EQ(RCL_RET_OK, rcl_executor_spin(executor, 1,
+      [](const rcl_executor_item_t * item, void * data) {
+        auto & s = *static_cast<State *>(data);
+        int64_t now;
+        EXPECT_EQ(RCL_RET_OK, rcl_clock_get_now(s.clock, &now));
+        std::lock_guard<std::mutex> lock(s.mutex);
+        s.calls[item->entity].push_back(now);
+      }, &state));
+    });
+  std::this_thread::sleep_for(20ms);
+  // Its jump callback runs after the executor's, which was registered with the first timer.
+  auto late = rcl_get_zero_initialized_timer();
+  ASSERT_EQ(RCL_RET_OK,
+    rcl_timer_init2(&late, &clock, &context, second / 10, nullptr, allocator, true));
+  ASSERT_EQ(RCL_RET_OK,
+    rcl_executor_add(executor, RCL_EXECUTOR_TIMER, &late, nullptr, 0, &second_id));
+  for (int64_t t = 1000 * second; t <= 1000 * second + second / 2; t += second / 100) {
+    ASSERT_EQ(RCL_RET_OK, rcl_set_ros_time_override(&clock, t));
+    std::this_thread::sleep_for(1ms);
+  }
+  ASSERT_EQ(RCL_RET_OK, rcl_set_ros_time_override(&clock, 900 * second));
+  std::this_thread::sleep_for(20ms);
+  ASSERT_EQ(RCL_RET_OK, rcl_set_ros_time_override(&clock, 900 * second + second / 10));
+  for (auto deadline = std::chrono::steady_clock::now() + 1s;
+    std::chrono::steady_clock::now() < deadline; std::this_thread::sleep_for(1ms))
+  {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    auto & calls = state.calls[&late];
+    if (!calls.empty() && calls.back() < 1000 * second) {break;}
+  }
+  rcl_executor_stop(handle);
+  spin.join();
+  for (const rcl_timer_t * timer : {&first, &late}) {
+    auto & calls = state.calls[timer];
+    ASSERT_FALSE(calls.empty());
+    EXPECT_EQ(900 * second + second / 10, calls.back());
+  }
+  EXPECT_EQ(RCL_RET_OK, rcl_executor_remove(executor, first_id));
+  EXPECT_EQ(RCL_RET_OK, rcl_executor_remove(executor, second_id));
+  EXPECT_EQ(RCL_RET_OK, rcl_timer_fini(&first));
+  EXPECT_EQ(RCL_RET_OK, rcl_timer_fini(&late));
+  EXPECT_EQ(RCL_RET_OK, rcl_clock_fini(&clock));
+  EXPECT_EQ(RCL_RET_OK, rcl_shutdown(&context));
+  EXPECT_EQ(RCL_RET_OK, rcl_context_fini(&context));
+  EXPECT_EQ(RCL_RET_OK, rcl_init_options_fini(&options));
+}
+
 #ifdef __linux__
 namespace
 {
