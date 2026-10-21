@@ -25,12 +25,15 @@
 #include <utility>
 #include "rcl/error_handling.h"
 #include "rmw/intra_process.h"
+#include "rmw/error_handling.h"
+#include "rmw/intra_process_serialized.h"
 #include "rosidl_runtime_c/string_functions.h"
 #include "rosidl_runtime_c/u16string_functions.h"
 #include "rosidl_typesupport_introspection_c/message_introspection.h"
 #include "rosidl_typesupport_introspection_cpp/message_introspection.hpp"
 #include "./intra_process_internal.h"
 #include "./context_impl.h"
+#include "./common.h"
 #include "./publisher_impl.h"
 #include "./subscription_impl.h"
 
@@ -45,6 +48,8 @@ struct Schema
   bool cpp;
   const void * members;
   std::shared_ptr<void> library;
+  const rosidl_message_type_support_t * support = nullptr;
+  std::shared_ptr<void> support_library;
   size_t size() const
   {
     return cpp ? static_cast<const XM *>(members)->size_of_ :
@@ -96,7 +101,8 @@ struct Field
   auto assign() const {return x ? x->assign_function : c->assign_function;}
   Schema nested(const Schema & parent) const
   {
-    return Schema{parent.cpp, x ? x->members_->data : c->members_->data, parent.library};
+    return Schema{parent.cpp, x ? x->members_->data : c->members_->data,
+      parent.library, nullptr, {}};
   }
 };
 Field field(const Schema & s, size_t i)
@@ -279,20 +285,25 @@ void view(const Schema & a, const void * src, const Schema & b, void * dst, Bloc
   }
 }
 std::shared_ptr<void> convert(const Schema & source, const void * data, const Schema & target);
+std::shared_ptr<void> pin(const void * address)
+{
+  Dl_info info{};
+  if (!dladdr(address, &info)) {return {};}
+  auto handle = dlopen(info.dli_fname, RTLD_NOW);
+  if (!handle) {return {};}
+  return std::shared_ptr<void>(handle, [](void * p) {dlclose(p);});
+}
 std::shared_ptr<Schema> schema(const rosidl_message_type_support_t * support)
 {
   bool cpp = std::strstr(support->typesupport_identifier, "cpp") != nullptr;
   auto id = cpp ? "rosidl_typesupport_introspection_cpp" : "rosidl_typesupport_introspection_c";
   auto introspection = support->func(support, id);
   if (!introspection) {rcl_reset_error(); return {};}
-  Dl_info info{};
-  if (!dladdr(introspection->data, &info)) {return {};}
-  auto library = std::shared_ptr<void>(dlopen(info.dli_fname, RTLD_NOW), [](void * p) {
-        dlclose(p);
-      });
-  return std::make_shared<Schema>(Schema{cpp, introspection->data, library});
+  auto library = pin(introspection->data);
+  if (!library) {return {};}
+  return std::make_shared<Schema>(Schema{cpp, introspection->data, library, support, pin(support)});
 }
-std::shared_ptr<void> clone(const Schema & source, const void * data, const Schema & target)
+std::shared_ptr<void> clone_message(const Schema & source, const void * data, const Schema & target)
 {
   auto p = std::malloc(target.size());
   if (!p) {throw std::bad_alloc();}
@@ -305,15 +316,68 @@ std::shared_ptr<void> clone(const Schema & source, const void * data, const Sche
   copy(source, data, target, p);
   return result;
 }
-// One owned source per publication; the other language is converted once, by its first taker.
+struct Serialized
+{
+  rcl_serialized_message_t value = rmw_get_zero_initialized_serialized_message();
+  Serialized()
+  {
+    auto allocator = rcutils_get_default_allocator();
+    if (rmw_serialized_message_init(&value, 0, &allocator) != RMW_RET_OK) {
+      throw std::bad_alloc();
+    }
+  }
+  ~Serialized() {rmw_serialized_message_fini(&value);}
+};
+// Representations are cached by their first taker, off the publisher's thread.
+struct ConversionFailure {rcl_ret_t status;};
 struct Publication
 {
   std::shared_ptr<void> source;
   std::shared_ptr<Schema> type;
   std::mutex mutex;
   std::shared_ptr<void> converted;
+  std::mutex serialized_mutex;
+  std::shared_ptr<Serialized> serialized;
+  bool encoded_source = false;
+  std::once_flag decode_once;
+  bool serialization_attempted = false;
+  rcl_ret_t serialization_status = RCL_RET_OK;
+  rcl_ret_t bytes(std::shared_ptr<Serialized> & output)
+  {
+    std::lock_guard<std::mutex> lock(serialized_mutex);
+    if (!serialization_attempted) {
+      auto result = std::make_shared<Serialized>();
+      serialization_status = rcl_convert_rmw_ret_to_rcl_ret(
+        rmw_serialize(source.get(), type->support, &result->value));
+      serialization_attempted = true;
+      if (serialization_status == RCL_RET_OK) {serialized = std::move(result);}
+    }
+    if (serialization_status != RCL_RET_OK) {
+      RCL_SET_ERROR_MSG("serializing intra-process message failed");
+      return serialization_status;
+    }
+    output = serialized;
+    return RCL_RET_OK;
+  }
   const void * get(const Schema & target)
   {
+    if (encoded_source) {
+      std::call_once(decode_once, [this] {
+          auto data = std::malloc(type->size());
+          if (!data) {throw std::bad_alloc();}
+          type->init(data);
+          auto owner = std::shared_ptr<void>(data, [type = type](void * p) {
+              type->fini(p); std::free(p);
+            });
+          auto ret = rcl_convert_rmw_ret_to_rcl_ret(
+            rmw_deserialize(&serialized->value, type->support, data));
+          if (ret != RCL_RET_OK) {
+            RCL_SET_ERROR_MSG("deserializing intra-process message failed");
+            throw ConversionFailure{ret};
+          }
+          source = std::move(owner);
+        });
+    }
     if (target.cpp == type->cpp) {return source.get();}
     std::lock_guard<std::mutex> lock(mutex);
     if (!converted) {converted = convert(*type, source.get(), target);}
@@ -322,7 +386,7 @@ struct Publication
 };
 std::shared_ptr<void> convert(const Schema & source, const void * data, const Schema & target)
 {
-  if (target.cpp) {return clone(source, data, target);}
+  if (target.cpp) {return clone_message(source, data, target);}
   auto root = std::calloc(1, target.size());
   if (!root) {throw std::bad_alloc();}
   auto blocks = std::make_shared<Blocks>();
@@ -361,6 +425,8 @@ struct Subscription
   std::shared_ptr<Schema> type;
   const rmw_subscription_t * rmw;
   const rmw_ipc_api_t * api;
+  const rmw_ipc_serialized_api_t * encoded_api;
+  std::atomic<bool> serialized{false};
   Gid gid;
   std::vector<Sample> queue;
   std::map<Gid, int64_t> admitted;
@@ -369,6 +435,7 @@ struct Broker
 {
   std::mutex mutex;
   const rmw_ipc_api_t * api;
+  const rmw_ipc_serialized_api_t * encoded_api = nullptr;
   std::shared_ptr<void> library;
   std::vector<std::weak_ptr<Subscription>> subscriptions;
 };
@@ -453,7 +520,7 @@ rmw_ret_t prepare(
       if (!known) {continue;}
       if (!shared) {
         shared = publication(publishing_owner.get() == message ? publishing_owner :
-            clone(*pub->type, message, *pub->type), pub->type);
+            clone_message(*pub->type, message, *pub->type), pub->type);
       }
       auto metadata = *info;
       metadata.from_intra_process = true;
@@ -509,6 +576,13 @@ void rcl_ipc_context_init(rcl_context_t * context)
     if (!api || api->version != 1 || api->size < sizeof(rmw_ipc_api_t)) {return;}
     auto broker = new Broker;
     broker->api = api;
+    auto encoded_getter = reinterpret_cast<rmw_get_ipc_serialized_api_fn>(
+      dlsym(library, "rmw_get_intra_process_serialized_api_v1"));
+    if (encoded_getter) {
+      auto encoded_api = encoded_getter();
+      if (encoded_api && encoded_api->version == 1 &&
+        encoded_api->size >= sizeof(rmw_ipc_serialized_api_t)) {broker->encoded_api = encoded_api;}
+    }
     broker->library = handle;
     context->impl->ipc = broker;
   } catch (const std::bad_alloc &) {
@@ -561,6 +635,7 @@ void rcl_ipc_subscription_init(
     sub->type = type;
     sub->rmw = subscription->impl->rmw_handle;
     sub->api = broker->api;
+    sub->encoded_api = broker->encoded_api;
     std::lock_guard<std::mutex> lock(broker->mutex);
     broker->subscriptions.erase(std::remove_if(broker->subscriptions.begin(),
     broker->subscriptions.end(), [](const auto & entry) {
@@ -574,14 +649,26 @@ void rcl_ipc_subscription_init(
       const rmw_message_info_t * info) -> rmw_ipc_ingress_result_t {
         auto sub = static_cast<Subscription *>(value);
         try {
-          auto data = std::malloc(sub->type->size());
-          if (!data) {return {0, nullptr, nullptr};}
-          sub->type->init(data);
-          auto owner = std::shared_ptr<void>(data, [type = sub->type](void * p) {
-            type->fini(p); std::free(p);
-          });
-          if (!decode(input, data)) {return {0, nullptr, nullptr};}
-          auto shared = publication(owner, sub->type);
+          std::shared_ptr<Publication> shared;
+          if (sub->serialized.load(std::memory_order_acquire)) {
+            auto bytes = std::make_shared<Serialized>();
+            if (sub->encoded_api->copy_ingress(input, &bytes->value) != RMW_RET_OK) {
+              return {0, nullptr, nullptr};
+            }
+            shared = publication({}, sub->type);
+            shared->encoded_source = true;
+            shared->serialized = bytes;
+            shared->serialization_attempted = true;
+          } else {
+            auto data = std::malloc(sub->type->size());
+            if (!data) {return {0, nullptr, nullptr};}
+            sub->type->init(data);
+            auto owner = std::shared_ptr<void>(data, [type = sub->type](void * p) {
+                type->fini(p); std::free(p);
+              });
+            if (!decode(input, data)) {return {0, nullptr, nullptr};}
+            shared = publication(owner, sub->type);
+          }
           auto retired = std::make_unique<Sample>();
           std::lock_guard<std::mutex> lock(sub->mutex);
           if (sub->closed) {return {0, nullptr, nullptr};}
@@ -607,6 +694,13 @@ void rcl_ipc_subscription_init(
   } catch (const std::bad_alloc &) {
     return;
   }
+}
+void rcl_subscription_set_serialized_ipc(rcl_subscription_t * subscription)
+{
+  if (!rcl_subscription_is_ipc_enabled(subscription)) {return;}
+  auto sub = *static_cast<std::shared_ptr<Subscription> *>(subscription->impl->ipc);
+  if (!sub->encoded_api) {rcl_subscription_disable_ipc(subscription); return;}
+  sub->serialized.store(true, std::memory_order_release);
 }
 void rcl_subscription_disable_ipc(rcl_subscription_t * subscription)
 {
@@ -668,8 +762,44 @@ rcl_ret_t rcl_take_ipc_message(
     if (info) {*info = result->sample.info;}
     *message = result.release();
     return RCL_RET_OK;
+  } catch (const ConversionFailure & error) {
+    return error.status;
   } catch (const std::bad_alloc &) {
     RCL_SET_ERROR_MSG("allocating retained message failed");
+    return RCL_RET_BAD_ALLOC;
+  }
+}
+rcl_ret_t rcl_ipc_take_serialized_copy(
+  const rcl_subscription_t * subscription, rcl_serialized_message_t * output,
+  rmw_message_info_t * info)
+{
+  try {
+    auto sub = *static_cast<std::shared_ptr<Subscription> *>(subscription->impl->ipc);
+    Sample sample;
+    {
+      std::lock_guard<std::mutex> lock(sub->mutex);
+      if (sub->queue.empty()) {return RCL_RET_SUBSCRIPTION_TAKE_FAILED;}
+      sample = std::move(sub->queue.front());
+      sub->queue.erase(sub->queue.begin());
+      sub->ready.store(sub->queue.size(), std::memory_order_release);
+    }
+    std::shared_ptr<Serialized> bytes;
+    auto ret = sample.owner->bytes(bytes);
+    if (ret != RCL_RET_OK) {return ret;}
+    auto size = bytes->value.buffer_length;
+    if (output->buffer_capacity < size) {
+      ret = rcl_convert_rmw_ret_to_rcl_ret(rmw_serialized_message_resize(output, size));
+      if (ret != RCL_RET_OK) {
+        RCL_SET_ERROR_MSG(rmw_get_error_string().str);
+        return ret;
+      }
+    }
+    std::memcpy(output->buffer, bytes->value.buffer, size);
+    output->buffer_length = size;
+    if (info) {*info = sample.info;}
+    return RCL_RET_OK;
+  } catch (const std::bad_alloc &) {
+    RCL_SET_ERROR_MSG("allocating serialized intra-process message failed");
     return RCL_RET_BAD_ALLOC;
   }
 }

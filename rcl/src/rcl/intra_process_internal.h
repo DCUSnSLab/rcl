@@ -22,6 +22,8 @@ void rcl_ipc_publisher_fini(rcl_publisher_t *);
 void rcl_ipc_subscription_init(rcl_subscription_t *, const rosidl_message_type_support_t *);
 rcl_ret_t rcl_ipc_publish(const rcl_publisher_t *, const void *);
 rcl_ret_t rcl_ipc_take_copy(const rcl_subscription_t *, void *, rmw_message_info_t *);
+rcl_ret_t rcl_ipc_take_serialized_copy(
+  const rcl_subscription_t *, rcl_serialized_message_t *, rmw_message_info_t *);
 #ifdef __cplusplus
 }
 #endif

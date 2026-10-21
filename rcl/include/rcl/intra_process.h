@@ -30,6 +30,8 @@ RCL_PUBLIC rcl_ret_t rcl_take_ipc_message(
   rcl_ipc_message_t ** message, const void ** data, rmw_message_info_t * info);
 RCL_PUBLIC void rcl_ipc_message_release(rcl_ipc_message_t * message);
 RCL_PUBLIC void rcl_subscription_disable_ipc(rcl_subscription_t * subscription);
+/// Preserve encoded ingress for generic and raw subscriptions without changing their cursor.
+RCL_PUBLIC void rcl_subscription_set_serialized_ipc(rcl_subscription_t * subscription);
 #ifdef __cplusplus
 }
 #endif

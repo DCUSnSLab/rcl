@@ -11,6 +11,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include <thread>
 #include <vector>
 #include "gtest/gtest.h"
@@ -32,6 +33,7 @@
 #include "rmw/serialized_message.h"
 #include "rmw/rmw.h"
 #include "rosidl_runtime_c/string_functions.h"
+#include "../rcl/test/mocking_utils/patch.hpp"
 
 namespace
 {
@@ -154,6 +156,168 @@ TEST_F(BrokerTest, DepthAndWriterOrder)
   }
   EXPECT_EQ(RCL_RET_SUBSCRIPTION_TAKE_FAILED, rcl_take(&subscription, result, nullptr, nullptr));
   sensor_msgs__msg__Image__destroy(result);
+}
+TEST_F(BrokerTest, SerializedAndTypedTakesShareOneCursor)
+{
+  send(1); send(2); send(3);
+  auto bytes = rmw_get_zero_initialized_serialized_message();
+  auto allocator = rcutils_get_default_allocator();
+  ASSERT_EQ(0, rmw_serialized_message_init(&bytes, 0, &allocator));
+  sensor_msgs::msg::Image decoded;
+  rmw_message_info_t info{};
+  ASSERT_EQ(0, rcl_take_serialized_message(&subscription, &bytes, &info, nullptr));
+  EXPECT_TRUE(info.from_intra_process);
+  ASSERT_EQ(0, rmw_deserialize(&bytes,
+      rosidl_typesupport_cpp::get_message_type_support_handle<sensor_msgs::msg::Image>(),
+      &decoded));
+  EXPECT_EQ(1u, decoded.height);
+  rcl_ipc_message_t * owner = nullptr;
+  const void * data = nullptr;
+  ASSERT_EQ(0, rcl_take_ipc_message(&subscription, &owner, &data, nullptr));
+  EXPECT_EQ(2u, static_cast<const sensor_msgs__msg__Image *>(data)->height);
+  rcl_ipc_message_release(owner);
+  ASSERT_EQ(0, rcl_take_serialized_message(&subscription, &bytes, &info, nullptr));
+  ASSERT_EQ(0, rmw_deserialize(&bytes,
+      rosidl_typesupport_cpp::get_message_type_support_handle<sensor_msgs::msg::Image>(),
+      &decoded));
+  EXPECT_EQ(3u, decoded.height);
+  EXPECT_EQ(RCL_RET_SUBSCRIPTION_TAKE_FAILED,
+    rcl_take_serialized_message(&subscription, &bytes, nullptr, nullptr));
+  EXPECT_EQ(0, rmw_serialized_message_fini(&bytes));
+}
+TEST_F(BrokerTest, SerializedFanoutAfterPublisherDestruction)
+{
+  auto second = rcl_get_zero_initialized_subscription();
+  auto options = rcl_subscription_get_default_options();
+  ASSERT_EQ(0, rcl_subscription_init(&second, &node,
+      rosidl_typesupport_cpp::get_message_type_support_handle<sensor_msgs::msg::Image>(),
+      "/broker_test", &options));
+  send(42);
+  ASSERT_EQ(0, rcl_publisher_fini(&publisher, &node));
+  auto first_bytes = rmw_get_zero_initialized_serialized_message();
+  auto second_bytes = rmw_get_zero_initialized_serialized_message();
+  auto allocator = rcutils_get_default_allocator();
+  ASSERT_EQ(0, rmw_serialized_message_init(&first_bytes, 1, &allocator));
+  ASSERT_EQ(0, rmw_serialized_message_init(&second_bytes, 0, &allocator));
+  std::thread reader([&] {
+      EXPECT_EQ(0, rcl_take_serialized_message(&second, &second_bytes, nullptr, nullptr));
+    });
+  EXPECT_EQ(0, rcl_take_serialized_message(&subscription, &first_bytes, nullptr, nullptr));
+  reader.join();
+  EXPECT_EQ(first_bytes.buffer_length, second_bytes.buffer_length);
+  EXPECT_EQ(0, std::memcmp(first_bytes.buffer, second_bytes.buffer, first_bytes.buffer_length));
+  sensor_msgs::msg::Image decoded;
+  ASSERT_EQ(0, rmw_deserialize(&first_bytes,
+      rosidl_typesupport_cpp::get_message_type_support_handle<sensor_msgs::msg::Image>(),
+      &decoded));
+  EXPECT_EQ(42u, decoded.height);
+  EXPECT_EQ("frame", decoded.header.frame_id);
+  EXPECT_EQ(0, rmw_serialized_message_fini(&first_bytes));
+  EXPECT_EQ(0, rmw_serialized_message_fini(&second_bytes));
+  EXPECT_EQ(0, rcl_subscription_fini(&second, &node));
+}
+TEST_F(BrokerTest, SerializedCacheIsLazyAndShared)
+{
+  auto first = rcl_get_zero_initialized_subscription();
+  auto second = rcl_get_zero_initialized_subscription();
+  auto options = rcl_subscription_get_default_options();
+  auto support = ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Image);
+  ASSERT_EQ(0, rcl_subscription_init(&first, &node, support, "/broker_test", &options));
+  ASSERT_EQ(0, rcl_subscription_init(&second, &node, support, "/broker_test", &options));
+  auto reference = rmw_get_zero_initialized_serialized_message();
+  auto allocator = rcutils_get_default_allocator();
+  ASSERT_EQ(0, rmw_serialized_message_init(&reference, 0, &allocator));
+  auto input = sensor_msgs__msg__Image__create();
+  input->height = 17;
+  ASSERT_TRUE(rosidl_runtime_c__String__assign(&input->header.frame_id, "frame"));
+  ASSERT_EQ(0, rmw_serialize(input, support, &reference));
+  sensor_msgs__msg__Image__destroy(input);
+  std::atomic<size_t> conversions{0};
+  auto patch = mocking_utils::patch("lib:rcl", rmw_serialize,
+      [&](const void *, const rosidl_message_type_support_t *, rmw_serialized_message_t * output) {
+        ++conversions;
+        auto ret = rmw_serialized_message_resize(output, reference.buffer_length);
+        if (ret != RMW_RET_OK) {return ret;}
+        std::memcpy(output->buffer, reference.buffer, reference.buffer_length);
+        output->buffer_length = reference.buffer_length;
+        return RMW_RET_OK;
+      });
+  send(17);
+  EXPECT_EQ(0u, conversions.load());
+  rcl_ipc_message_t * owner = nullptr;
+  const void * data = nullptr;
+  ASSERT_EQ(0, rcl_take_ipc_message(&subscription, &owner, &data, nullptr));
+  rcl_ipc_message_release(owner);
+  EXPECT_EQ(0u, conversions.load());
+  auto first_bytes = rmw_get_zero_initialized_serialized_message();
+  auto second_bytes = rmw_get_zero_initialized_serialized_message();
+  ASSERT_EQ(0, rmw_serialized_message_init(&first_bytes, 0, &allocator));
+  ASSERT_EQ(0, rmw_serialized_message_init(&second_bytes, 0, &allocator));
+  std::thread reader([&] {
+      EXPECT_EQ(0, rcl_take_serialized_message(&first, &first_bytes, nullptr, nullptr));
+    });
+  EXPECT_EQ(0, rcl_take_serialized_message(&second, &second_bytes, nullptr, nullptr));
+  reader.join();
+  EXPECT_EQ(1u, conversions.load());
+  EXPECT_EQ(reference.buffer_length, first_bytes.buffer_length);
+  EXPECT_EQ(reference.buffer_length, second_bytes.buffer_length);
+  EXPECT_EQ(0, rmw_serialized_message_fini(&first_bytes));
+  EXPECT_EQ(0, rmw_serialized_message_fini(&second_bytes));
+  EXPECT_EQ(0, rmw_serialized_message_fini(&reference));
+  EXPECT_EQ(0, rcl_subscription_fini(&first, &node));
+  EXPECT_EQ(0, rcl_subscription_fini(&second, &node));
+}
+TEST_F(BrokerTest, SerializedPublisherPreservesWireBytesAndTypedCursor)
+{
+  rcl_subscription_set_serialized_ipc(&subscription);
+  ASSERT_TRUE(rcl_subscription_is_ipc_enabled(&subscription));
+  auto expected = rmw_get_zero_initialized_serialized_message();
+  auto output = rmw_get_zero_initialized_serialized_message();
+  auto allocator = rcutils_get_default_allocator();
+  ASSERT_EQ(0, rmw_serialized_message_init(&expected, 0, &allocator));
+  ASSERT_EQ(0, rmw_serialized_message_init(&output, 0, &allocator));
+  auto input = sensor_msgs__msg__Image__create();
+  input->height = 123;
+  ASSERT_TRUE(rosidl_runtime_c__String__assign(&input->header.frame_id, "wire"));
+  ASSERT_EQ(0,
+      rmw_serialize(input, ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Image), &expected));
+  sensor_msgs__msg__Image__destroy(input);
+  size_t conversions = 0;
+  auto patch = mocking_utils::patch("lib:rcl", rmw_serialize,
+      [&](const void *, const rosidl_message_type_support_t *, rmw_serialized_message_t *) {
+        ++conversions;
+        return RMW_RET_ERROR;
+      });
+  ASSERT_EQ(0, rcl_publish_serialized_message(&publisher, &expected, nullptr));
+  rcl_ret_t ret = RCL_RET_SUBSCRIPTION_TAKE_FAILED;
+  for (int i = 0; i < 200 && ret == RCL_RET_SUBSCRIPTION_TAKE_FAILED; ++i) {
+    ret = rcl_take_serialized_message(&subscription, &output, nullptr, nullptr);
+    if (ret == RCL_RET_SUBSCRIPTION_TAKE_FAILED) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+  ASSERT_EQ(0, ret);
+  EXPECT_EQ(0u, conversions);
+  ASSERT_EQ(expected.buffer_length, output.buffer_length);
+  EXPECT_EQ(0, std::memcmp(expected.buffer, output.buffer, expected.buffer_length));
+  ASSERT_EQ(0, rcl_publish_serialized_message(&publisher, &expected, nullptr));
+  auto decoded = sensor_msgs__msg__Image__create();
+  ret = RCL_RET_SUBSCRIPTION_TAKE_FAILED;
+  for (int i = 0; i < 200 && ret == RCL_RET_SUBSCRIPTION_TAKE_FAILED; ++i) {
+    ret = rcl_take(&subscription, decoded, nullptr, nullptr);
+    if (ret == RCL_RET_SUBSCRIPTION_TAKE_FAILED) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+  ASSERT_EQ(0, ret);
+  EXPECT_EQ(123u, decoded->height);
+  EXPECT_STREQ("wire", decoded->header.frame_id.data);
+  EXPECT_EQ(0u, conversions);
+  EXPECT_EQ(RCL_RET_SUBSCRIPTION_TAKE_FAILED,
+    rcl_take_serialized_message(&subscription, &output, nullptr, nullptr));
+  sensor_msgs__msg__Image__destroy(decoded);
+  EXPECT_EQ(0, rmw_serialized_message_fini(&expected));
+  EXPECT_EQ(0, rmw_serialized_message_fini(&output));
 }
 TEST_F(BrokerTest, BestEffortDepth)
 {

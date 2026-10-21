@@ -664,6 +664,10 @@ rcl_take_serialized_message(
   }
   RCL_CHECK_ARGUMENT_FOR_NULL(serialized_message, RCL_RET_INVALID_ARGUMENT);
   // If message_info is NULL, use a place holder which can be discarded.
+  if (subscription->impl->ipc) {
+    return rcl_ipc_take_serialized_copy(subscription, serialized_message, message_info);
+  }
+
   rmw_message_info_t dummy_message_info;
   rmw_message_info_t * message_info_local = message_info ? message_info : &dummy_message_info;
   *message_info_local = rmw_get_zero_initialized_message_info();
