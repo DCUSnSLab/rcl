@@ -937,6 +937,9 @@ rcl_ret_t rcl_ipc_take_serialized_copy(
       if (info) {*info = sample.info;}
       return RCL_RET_OK;
     }
+    if (info) {*info = sample.info;}
+    // Free the publication before allocating the reader's buffer, which can then reuse its pages.
+    sample.owner.reset();
     auto size = bytes->value.buffer_length;
     if (output->buffer_capacity < size) {
       ret = rcl_convert_rmw_ret_to_rcl_ret(rmw_serialized_message_resize(output, size));
@@ -947,7 +950,6 @@ rcl_ret_t rcl_ipc_take_serialized_copy(
     }
     std::memcpy(output->buffer, bytes->value.buffer, size);
     output->buffer_length = size;
-    if (info) {*info = sample.info;}
     return RCL_RET_OK;
   } catch (const std::bad_alloc &) {
     RCL_SET_ERROR_MSG("allocating serialized intra-process message failed");
