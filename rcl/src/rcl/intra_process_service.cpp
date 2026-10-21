@@ -61,6 +61,7 @@ struct Endpoint
   rosidl_type_hash_t hash;
   std::shared_ptr<rcl_ipc::Type> request;
   std::shared_ptr<rcl_ipc::Type> response;
+  std::shared_ptr<rcl_ipc::Pool> incoming;
   std::deque<Sample> queue;
   const rmw_ipc_service_api_t * api;
 };
@@ -140,23 +141,28 @@ rmw_ret_t prepare(
   auto & state = *static_cast<Prepared *>(user);
   auto client = state.client;
   try {
-    std::lock_guard<std::mutex> lock(client->broker->mutex);
-    for (const auto & weak : client->broker->services) {
-      auto service = weak.lock();
-      if (!service || std::memcmp(service->gid.data(), matched, service->gid.size())) {continue;}
-      if (service->hash.version != client->hash.version ||
-        std::memcmp(service->hash.value, client->hash.value, sizeof(client->hash.value)))
-      {return RMW_RET_OK;}
-      auto data_copy = rcl_ipc::clone(*client->request, data, *service->request);
-      std::lock_guard<std::mutex> service_lock(service->mutex);
-      if (service->closed) {return RMW_RET_OK;}
-      service->queue.push_back(Sample{std::move(data_copy), *info, client});
-      if (service->queue.size() > service->depth) {service->queue.pop_front();}
-      service->ready.store(service->queue.size(), std::memory_order_release);
-      state.notify = service;
-      *delivered = true;
-      return RMW_RET_OK;
+    std::shared_ptr<Service> service;
+    {
+      std::lock_guard<std::mutex> lock(client->broker->mutex);
+      for (const auto & weak : client->broker->services) {
+        auto candidate = weak.lock();
+        if (candidate && !std::memcmp(candidate->gid.data(), matched, candidate->gid.size())) {
+          service = std::move(candidate);
+          break;
+        }
+      }
     }
+    if (!service || service->hash.version != client->hash.version ||
+      std::memcmp(service->hash.value, client->hash.value, sizeof(client->hash.value)))
+    {return RMW_RET_OK;}
+    auto data_copy = rcl_ipc::clone(*client->request, data, service->incoming);
+    std::lock_guard<std::mutex> service_lock(service->mutex);
+    if (service->closed) {return RMW_RET_OK;}
+    service->queue.push_back(Sample{std::move(data_copy), *info, client});
+    if (service->queue.size() > service->depth) {service->queue.pop_front();}
+    service->ready.store(service->queue.size(), std::memory_order_release);
+    state.notify = service;
+    *delivered = true;
     return RMW_RET_OK;
   } catch (const std::bad_alloc &) {
     RMW_SET_ERROR_MSG("allocating intra-process request failed");
@@ -198,6 +204,7 @@ void * rcl_ipc_client_init(
       rcl_client_response_subscription_get_actual_qos(client));
     if (!value || !supported(rcl_client_request_publisher_get_actual_qos(client))) {return nullptr;}
     value->rmw = rcl_client_get_rmw_handle(client);
+    value->incoming = rcl_ipc::pool(*value->response);
     value->broker = static_cast<Broker *>(node->context->impl->ipc_services);
     auto holder = std::make_unique<std::shared_ptr<Client>>(value);
     value->api->configure_client(value->rmw, ready, value.get());
@@ -216,6 +223,7 @@ void * rcl_ipc_service_init(
       return nullptr;
     }
     value->rmw = rcl_service_get_rmw_handle(service);
+    value->incoming = rcl_ipc::pool(*value->request);
     auto broker = static_cast<Broker *>(node->context->impl->ipc_services);
     auto holder = std::make_unique<std::shared_ptr<Service>>(value);
     std::lock_guard<std::mutex> lock(broker->mutex);
@@ -270,18 +278,49 @@ rcl_ret_t rcl_ipc_send_request(void * input, const void * data, int64_t * sequen
   }
   return ret;
 }
+namespace
+{
+Sample pop(Endpoint & endpoint)
+{
+  Sample sample;
+  if (!endpoint.queue.empty()) {
+    sample = std::move(endpoint.queue.front());
+    endpoint.queue.pop_front();
+    endpoint.ready.store(endpoint.queue.size(), std::memory_order_release);
+  }
+  return sample;
+}
+Sample pop_request(Service & service)
+{
+  std::lock_guard<std::mutex> lock(service.mutex);
+  auto sample = pop(service);
+  if (sample.data) {
+    service.pending.emplace(key(sample.info.request_id), Route{sample.client, false});
+  }
+  return sample;
+}
+Sample pop_response(Client & client)
+{
+  std::lock_guard<std::mutex> lock(client.mutex);
+  return pop(client);
+}
+rcl_ret_t hand_over(
+  Sample & sample, rmw_service_info_t * info, rcl_ipc_message_t ** message, void ** data)
+{
+  *message = new rcl_ipc_message_t{std::move(sample.data)};
+  *data = (*message)->owner.get();
+  *info = sample.info;
+  return RCL_RET_OK;
+}
+}  // namespace
 rcl_ret_t rcl_ipc_take_request(void * input, rmw_service_info_t * info, void * data, bool * taken)
 {
   auto service = *static_cast<std::shared_ptr<Service> *>(input);
   try {
-    std::lock_guard<std::mutex> lock(service->mutex);
-    if (!service->queue.empty()) {
-      auto & sample = service->queue.front();
-      rcl_ipc::copy(*service->request, sample.data.get(), *service->request, data);
-      service->pending.emplace(key(sample.info.request_id), Route{sample.client, false});
+    auto sample = pop_request(*service);
+    if (sample.data) {
+      rcl_ipc::take(*service->request, sample.data.get(), data);
       *info = sample.info;
-      service->queue.pop_front();
-      service->ready.store(service->queue.size(), std::memory_order_release);
       *taken = true;
       return RCL_RET_OK;
     }
@@ -305,13 +344,10 @@ rcl_ret_t rcl_ipc_take_response(void * input, rmw_service_info_t * info, void * 
 {
   auto client = *static_cast<std::shared_ptr<Client> *>(input);
   try {
-    std::lock_guard<std::mutex> lock(client->mutex);
-    if (!client->queue.empty()) {
-      auto & sample = client->queue.front();
-      rcl_ipc::copy(*client->response, sample.data.get(), *client->response, data);
+    auto sample = pop_response(*client);
+    if (sample.data) {
+      rcl_ipc::take(*client->response, sample.data.get(), data);
       *info = sample.info;
-      client->queue.pop_front();
-      client->ready.store(client->queue.size(), std::memory_order_release);
       *taken = true;
       return RCL_RET_OK;
     }
@@ -321,25 +357,78 @@ rcl_ret_t rcl_ipc_take_response(void * input, rmw_service_info_t * info, void * 
   }
   return rmw_take_response(client->rmw, info, data, taken);
 }
-rcl_ret_t rcl_ipc_send_response(void * input, rmw_request_id_t * id, void * data)
+rcl_ret_t rcl_ipc_take_owned_request(
+  void * input, rmw_service_info_t * info, rcl_ipc_message_t ** message, void ** data)
 {
   auto service = *static_cast<std::shared_ptr<Service> *>(input);
+  try {
+    auto sample = pop_request(*service);
+    if (!sample.data) {return RCL_RET_SERVICE_TAKE_FAILED;}
+    return hand_over(sample, info, message, data);
+  } catch (const std::bad_alloc &) {
+    RCL_SET_ERROR_MSG("allocating intra-process request failed");
+    return RCL_RET_BAD_ALLOC;
+  }
+}
+rcl_ret_t rcl_ipc_take_owned_response(
+  void * input, rmw_service_info_t * info, rcl_ipc_message_t ** message, void ** data)
+{
+  auto client = *static_cast<std::shared_ptr<Client> *>(input);
+  try {
+    auto sample = pop_response(*client);
+    if (!sample.data) {return RCL_RET_CLIENT_TAKE_FAILED;}
+    return hand_over(sample, info, message, data);
+  } catch (const std::bad_alloc &) {
+    RCL_SET_ERROR_MSG("allocating intra-process response failed");
+    return RCL_RET_BAD_ALLOC;
+  }
+}
+rcl_ret_t rcl_ipc_borrow_response(
+  void * input, const rmw_request_id_t * id, rcl_ipc_message_t ** message, void ** data)
+{
+  auto service = *static_cast<std::shared_ptr<Service> *>(input);
+  try {
+    std::shared_ptr<Client> client;
+    {
+      std::lock_guard<std::mutex> lock(service->mutex);
+      auto route = service->pending.find(key(*id));
+      if (route != service->pending.end() && !route->second.rmw) {
+        client = route->second.client.lock();
+      }
+    }
+    if (!client || !rcl_ipc::same(*service->response, *client->incoming)) {
+      return RCL_RET_UNSUPPORTED;
+    }
+    *message = new rcl_ipc_message_t{rcl_ipc::borrow(client->incoming)};
+    *data = (*message)->owner.get();
+    return RCL_RET_OK;
+  } catch (const std::bad_alloc &) {
+    RCL_SET_ERROR_MSG("allocating intra-process response failed");
+    return RCL_RET_BAD_ALLOC;
+  }
+}
+void * rcl_ipc_message_data(rcl_ipc_message_t * message) {return message->owner.get();}
+namespace
+{
+template<typename Payload>
+rcl_ret_t respond(Service & service, rmw_request_id_t * id, void * data, Payload payload)
+{
   std::shared_ptr<Client> client;
   try {
-    std::lock_guard<std::mutex> lock(service->mutex);
-    auto route = service->pending.find(key(*id));
-    if (route == service->pending.end()) {
+    std::lock_guard<std::mutex> lock(service.mutex);
+    auto route = service.pending.find(key(*id));
+    if (route == service.pending.end()) {
       RMW_SET_ERROR_MSG("request has no pending response route");
       return RMW_RET_ERROR;
     }
     if (route->second.rmw) {
-      auto ret = rmw_send_response(service->rmw, id, data);
-      if (ret == RMW_RET_OK) {service->pending.erase(route);}
+      auto ret = rmw_send_response(service.rmw, id, data);
+      if (ret == RMW_RET_OK) {service.pending.erase(route);}
       return ret;
     }
     client = route->second.client.lock();
-    if (!client) {service->pending.erase(route); return RCL_RET_OK;}
-    auto response = rcl_ipc::clone(*service->response, data, *client->response);
+    if (!client) {service.pending.erase(route); return RCL_RET_OK;}
+    auto response = payload(*client);
     {
       std::lock_guard<std::mutex> client_lock(client->mutex);
       if (!client->closed) {
@@ -352,7 +441,7 @@ rcl_ret_t rcl_ipc_send_response(void * input, rmw_request_id_t * id, void * data
         client->ready.store(client->queue.size(), std::memory_order_release);
       }
     }
-    service->pending.erase(route);
+    service.pending.erase(route);
   } catch (const std::bad_alloc &) {
     RMW_SET_ERROR_MSG("allocating intra-process service message failed");
     return RCL_RET_BAD_ALLOC;
@@ -360,4 +449,19 @@ rcl_ret_t rcl_ipc_send_response(void * input, rmw_request_id_t * id, void * data
   std::lock_guard<std::mutex> notify_lock(client->notify_mutex);
   if (!client->closed) {client->api->notify_client(client->rmw);}
   return RCL_RET_OK;
+}
+}  // namespace
+rcl_ret_t rcl_ipc_send_response(void * input, rmw_request_id_t * id, void * data)
+{
+  auto service = *static_cast<std::shared_ptr<Service> *>(input);
+  return respond(*service, id, data, [&](Client & client) {
+             return rcl_ipc::clone(*service->response, data, client.incoming);
+    });
+}
+rcl_ret_t rcl_ipc_send_owned_response(
+  void * input, rmw_request_id_t * id,
+  rcl_ipc_message_t * message)
+{
+  auto service = *static_cast<std::shared_ptr<Service> *>(input);
+  return respond(*service, id, message->owner.get(), [message](Client &) {return message->owner;});
 }

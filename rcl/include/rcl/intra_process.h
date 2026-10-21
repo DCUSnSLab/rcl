@@ -11,7 +11,9 @@
 
 #ifndef RCL__INTRA_PROCESS_H_
 #define RCL__INTRA_PROCESS_H_
+#include "rcl/client.h"
 #include "rcl/publisher.h"
+#include "rcl/service.h"
 #include "rcl/subscription.h"
 #ifdef __cplusplus
 extern "C" {
@@ -32,6 +34,22 @@ RCL_PUBLIC void rcl_ipc_message_release(rcl_ipc_message_t * message);
 RCL_PUBLIC void rcl_subscription_disable_ipc(rcl_subscription_t * subscription);
 /// Preserve encoded ingress for generic and raw subscriptions without changing their cursor.
 RCL_PUBLIC void rcl_subscription_set_serialized_ipc(rcl_subscription_t * subscription);
+/// Take a broker request without copying it; the caller owns it until release.
+RCL_PUBLIC rcl_ret_t rcl_take_ipc_request(
+  const rcl_service_t * service, rmw_service_info_t * request_header,
+  rcl_ipc_message_t ** message, void ** data);
+/// Take a broker response without copying it; the caller owns it until release.
+RCL_PUBLIC rcl_ret_t rcl_take_ipc_response(
+  const rcl_client_t * client, rmw_service_info_t * request_header,
+  rcl_ipc_message_t ** message, void ** data);
+/// A default response from the requesting client's broker buffers, or RCL_RET_UNSUPPORTED.
+RCL_PUBLIC rcl_ret_t rcl_borrow_ipc_response(
+  const rcl_service_t * service, const rmw_request_id_t * request_header,
+  rcl_ipc_message_t ** message, void ** data);
+/// Send a borrowed response without copying it; the caller must not modify it afterwards.
+RCL_PUBLIC rcl_ret_t rcl_send_ipc_response(
+  const rcl_service_t * service, rmw_request_id_t * request_header,
+  rcl_ipc_message_t * message);
 #ifdef __cplusplus
 }
 #endif

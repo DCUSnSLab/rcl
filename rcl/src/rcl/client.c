@@ -358,6 +358,32 @@ rcl_send_request(const rcl_client_t * client, const void * ros_request, int64_t 
   return RCL_RET_OK;
 }
 
+static rcl_ret_t
+response_received(
+  const rcl_client_t * client, const rmw_service_info_t * request_header,
+  const void * ros_response)
+{
+  if (client->impl->service_event_publisher != NULL) {
+    rmw_gid_t gid;
+    rmw_ret_t rmw_ret = rmw_get_gid_for_client(client->impl->rmw_handle, &gid);
+    if (rmw_ret != RMW_RET_OK) {
+      RCL_SET_ERROR_MSG(rmw_get_error_string().str);
+      return rcl_convert_rmw_ret_to_rcl_ret(rmw_ret);
+    }
+    rcl_ret_t ret = rcl_send_service_event_message(
+      client->impl->service_event_publisher,
+      service_msgs__msg__ServiceEventInfo__RESPONSE_RECEIVED,
+      ros_response,
+      request_header->request_id.sequence_number,
+      gid.data);
+    if (RCL_RET_OK != ret) {
+      RCL_SET_ERROR_MSG(rcl_get_error_string().str);
+      return ret;
+    }
+  }
+  return RCL_RET_OK;
+}
+
 rcl_ret_t
 rcl_take_response_with_info(
   const rcl_client_t * client,
@@ -387,26 +413,28 @@ rcl_take_response_with_info(
   if (!taken) {
     return RCL_RET_CLIENT_TAKE_FAILED;
   }
+  return response_received(client, request_header, ros_response);
+}
 
-  if (client->impl->service_event_publisher != NULL) {
-    rmw_gid_t gid;
-    rmw_ret_t rmw_ret = rmw_get_gid_for_client(client->impl->rmw_handle, &gid);
-    if (rmw_ret != RMW_RET_OK) {
-      RCL_SET_ERROR_MSG(rmw_get_error_string().str);
-      return rcl_convert_rmw_ret_to_rcl_ret(rmw_ret);
-    }
-    rcl_ret_t ret = rcl_send_service_event_message(
-      client->impl->service_event_publisher,
-      service_msgs__msg__ServiceEventInfo__RESPONSE_RECEIVED,
-      ros_response,
-      request_header->request_id.sequence_number,
-      gid.data);
-    if (RCL_RET_OK != ret) {
-      RCL_SET_ERROR_MSG(rcl_get_error_string().str);
-      return ret;
-    }
+rcl_ret_t
+rcl_take_ipc_response(
+  const rcl_client_t * client, rmw_service_info_t * request_header,
+  rcl_ipc_message_t ** message, void ** data)
+{
+  if (!rcl_client_is_valid(client)) {
+    return RCL_RET_CLIENT_INVALID;  // error already set
   }
-  return RCL_RET_OK;
+  RCL_CHECK_ARGUMENT_FOR_NULL(request_header, RCL_RET_INVALID_ARGUMENT);
+  RCL_CHECK_ARGUMENT_FOR_NULL(message, RCL_RET_INVALID_ARGUMENT);
+  RCL_CHECK_ARGUMENT_FOR_NULL(data, RCL_RET_INVALID_ARGUMENT);
+  if (!client->impl->ipc) {
+    return RCL_RET_CLIENT_TAKE_FAILED;
+  }
+  rcl_ret_t ret = rcl_ipc_take_owned_response(client->impl->ipc, request_header, message, data);
+  if (RCL_RET_OK != ret) {
+    return ret;
+  }
+  return response_received(client, request_header, *data);
 }
 
 rcl_ret_t

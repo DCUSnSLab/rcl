@@ -316,7 +316,7 @@ std::shared_ptr<void> clone_message(const Schema & source, const void * data, co
       std::free(value);
     };
   auto result = std::shared_ptr<void>(p, destroy);
-  copy(source, data, target, p);
+  if (data) {copy(source, data, target, p);}
   return result;
 }
 struct Serialized
@@ -331,6 +331,47 @@ struct Serialized
   }
   ~Serialized() {rmw_serialized_message_fini(&value);}
 };
+struct MessagePool
+{
+  std::mutex mutex;
+  std::shared_ptr<Schema> schema;
+  std::shared_ptr<void> defaults;
+  void * spare = nullptr;
+  ~MessagePool()
+  {
+    if (spare) {schema->fini(spare); std::free(spare);}
+  }
+};
+// A released message keeps its buffers, so refilling it does not fault pages in again.
+std::shared_ptr<void> acquire(const std::shared_ptr<MessagePool> & pool, bool & reused)
+{
+  void * p;
+  {
+    std::lock_guard<std::mutex> lock(pool->mutex);
+    p = std::exchange(pool->spare, nullptr);
+  }
+  reused = p != nullptr;
+  if (!p) {
+    p = std::malloc(pool->schema->size());
+    if (!p) {throw std::bad_alloc();}
+    pool->schema->init(p);
+  }
+  return std::shared_ptr<void>(p, [pool](void * value) {
+             {
+               std::lock_guard<std::mutex> lock(pool->mutex);
+               if (!pool->spare) {pool->spare = value; return;}
+             }
+             pool->schema->fini(value);
+             std::free(value);
+    });
+}
+void take_message(const Schema & schema, void * data, void * output)
+{
+  if (schema.cpp) {copy(schema, data, schema, output); return;}
+  // C messages hold plain pointers, so a message nobody else holds moves by swapping its bytes.
+  std::swap_ranges(static_cast<char *>(data), static_cast<char *>(data) + schema.size(),
+    static_cast<char *>(output));
+}
 struct SerializedPool
 {
   std::mutex mutex;
@@ -620,8 +661,38 @@ namespace rcl_ipc
   {
     ::copy(*source.schema, data, *target.schema, output);
   }
+  struct Pool : MessagePool {};
+  std::shared_ptr<Pool> pool(const Type & type)
+  {
+    auto result = std::make_shared<Pool>();
+    result->schema = type.schema;
+    result->defaults = clone_message(*type.schema, nullptr, *type.schema);
+    return result;
+  }
+  bool same(const Type & type, const Pool & pool)
+  {
+    return type.schema->cpp == pool.schema->cpp && type.schema->members == pool.schema->members;
+  }
+  std::shared_ptr<void> clone(
+    const Type & source, const void * data, const std::shared_ptr<Pool> & target)
+  {
+    bool reused;
+    auto result = acquire(target, reused);
+    ::copy(*source.schema, data, *target->schema, result.get());
+    return result;
+  }
+  void take(const Type & type, void * data, void * output)
+  {
+    take_message(*type.schema, data, output);
+  }
+  std::shared_ptr<void> borrow(const std::shared_ptr<Pool> & pool)
+  {
+    bool reused;
+    auto result = acquire(pool, reused);
+    if (reused) {::copy(*pool->schema, pool->defaults.get(), *pool->schema, result.get());}
+    return result;
+  }
 }  // namespace rcl_ipc
-struct rcl_ipc_message_s {Sample sample;};
 
 void rcl_ipc_context_init(rcl_context_t * context)
 {
@@ -814,15 +885,17 @@ rcl_ret_t rcl_take_ipc_message(
     if (!rcl_subscription_is_ipc_enabled(subscription)) {return RCL_RET_SUBSCRIPTION_TAKE_FAILED;}
     auto sub = *static_cast<std::shared_ptr<Subscription> *>(subscription->impl->ipc);
     auto result = std::make_unique<rcl_ipc_message_t>();
+    Sample sample;
     {
       std::lock_guard<std::mutex> lock(sub->mutex);
       if (sub->queue.empty()) {return RCL_RET_SUBSCRIPTION_TAKE_FAILED;}
-      result->sample = std::move(sub->queue.front());
+      sample = std::move(sub->queue.front());
       sub->queue.erase(sub->queue.begin());
       sub->ready.store(sub->queue.size(), std::memory_order_release);
     }
-    *data = result->sample.owner->get(*sub->type);
-    if (info) {*info = result->sample.info;}
+    *data = sample.owner->get(*sub->type);
+    if (info) {*info = sample.info;}
+    result->owner = std::move(sample.owner);
     *message = result.release();
     return RCL_RET_OK;
   } catch (const ConversionFailure & error) {

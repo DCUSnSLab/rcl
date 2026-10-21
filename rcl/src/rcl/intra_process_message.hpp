@@ -23,6 +23,14 @@ std::shared_ptr<void> clone(const Type & source, const void * data, const Type &
 // NOLINTNEXTLINE(build/include_what_you_use)
 void copy(
   const Type & source, const void * data, const Type & target, void * output);
+struct Pool;
+std::shared_ptr<Pool> pool(const Type & type);
+bool same(const Type & type, const Pool & pool);
+std::shared_ptr<void> clone(
+  const Type & source, const void * data, const std::shared_ptr<Pool> & target);
+std::shared_ptr<void> borrow(const std::shared_ptr<Pool> & pool);
+void take(const Type & type, void * data, void * output);
 }  // namespace rcl_ipc
+struct rcl_ipc_message_s {std::shared_ptr<void> owner;};
 
 #endif  // RCL__INTRA_PROCESS_MESSAGE_HPP_

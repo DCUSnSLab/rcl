@@ -326,6 +326,26 @@ rcl_service_get_rmw_handle(const rcl_service_t * service)
   return service->impl->rmw_handle;
 }
 
+static rcl_ret_t
+request_received(
+  const rcl_service_t * service, const rmw_service_info_t * request_header,
+  const void * ros_request)
+{
+  if (service->impl->service_event_publisher != NULL) {
+    rcl_ret_t rclret = rcl_send_service_event_message(
+      service->impl->service_event_publisher,
+      service_msgs__msg__ServiceEventInfo__REQUEST_RECEIVED,
+      ros_request,
+      request_header->request_id.sequence_number,
+      request_header->request_id.writer_guid);
+    if (RCL_RET_OK != rclret) {
+      RCL_SET_ERROR_MSG(rcl_get_error_string().str);
+      return rclret;
+    }
+  }
+  return RCL_RET_OK;
+}
+
 rcl_ret_t
 rcl_take_request_with_info(
   const rcl_service_t * service,
@@ -357,19 +377,28 @@ rcl_take_request_with_info(
   if (!taken) {
     return RCL_RET_SERVICE_TAKE_FAILED;
   }
-  if (service->impl->service_event_publisher != NULL) {
-    rcl_ret_t rclret = rcl_send_service_event_message(
-      service->impl->service_event_publisher,
-      service_msgs__msg__ServiceEventInfo__REQUEST_RECEIVED,
-      ros_request,
-      request_header->request_id.sequence_number,
-      request_header->request_id.writer_guid);
-    if (RCL_RET_OK != rclret) {
-      RCL_SET_ERROR_MSG(rcl_get_error_string().str);
-      return rclret;
-    }
+  return request_received(service, request_header, ros_request);
+}
+
+rcl_ret_t
+rcl_take_ipc_request(
+  const rcl_service_t * service, rmw_service_info_t * request_header,
+  rcl_ipc_message_t ** message, void ** data)
+{
+  if (!rcl_service_is_valid(service)) {
+    return RCL_RET_SERVICE_INVALID;  // error already set
   }
-  return RCL_RET_OK;
+  RCL_CHECK_ARGUMENT_FOR_NULL(request_header, RCL_RET_INVALID_ARGUMENT);
+  RCL_CHECK_ARGUMENT_FOR_NULL(message, RCL_RET_INVALID_ARGUMENT);
+  RCL_CHECK_ARGUMENT_FOR_NULL(data, RCL_RET_INVALID_ARGUMENT);
+  if (!service->impl->ipc) {
+    return RCL_RET_SERVICE_TAKE_FAILED;
+  }
+  rcl_ret_t ret = rcl_ipc_take_owned_request(service->impl->ipc, request_header, message, data);
+  if (RCL_RET_OK != ret) {
+    return ret;
+  }
+  return request_received(service, request_header, *data);
 }
 
 rcl_ret_t
@@ -424,6 +453,45 @@ rcl_send_response(
       RCL_SET_ERROR_MSG(rcl_get_error_string().str);
       return ret;
     }
+  }
+  return RCL_RET_OK;
+}
+
+rcl_ret_t
+rcl_borrow_ipc_response(
+  const rcl_service_t * service, const rmw_request_id_t * request_header,
+  rcl_ipc_message_t ** message, void ** data)
+{
+  if (!rcl_service_is_valid(service)) {
+    return RCL_RET_SERVICE_INVALID;  // error already set
+  }
+  RCL_CHECK_ARGUMENT_FOR_NULL(request_header, RCL_RET_INVALID_ARGUMENT);
+  RCL_CHECK_ARGUMENT_FOR_NULL(message, RCL_RET_INVALID_ARGUMENT);
+  RCL_CHECK_ARGUMENT_FOR_NULL(data, RCL_RET_INVALID_ARGUMENT);
+  if (!service->impl->ipc) {
+    return RCL_RET_UNSUPPORTED;
+  }
+  return rcl_ipc_borrow_response(service->impl->ipc, request_header, message, data);
+}
+
+rcl_ret_t
+rcl_send_ipc_response(
+  const rcl_service_t * service, rmw_request_id_t * request_header,
+  rcl_ipc_message_t * message)
+{
+  if (!rcl_service_is_valid(service)) {
+    return RCL_RET_SERVICE_INVALID;  // error already set
+  }
+  RCL_CHECK_ARGUMENT_FOR_NULL(request_header, RCL_RET_INVALID_ARGUMENT);
+  RCL_CHECK_ARGUMENT_FOR_NULL(message, RCL_RET_INVALID_ARGUMENT);
+  // The introspection event reads the response after sending, so it keeps the copying path.
+  if (!service->impl->ipc || service->impl->service_event_publisher != NULL) {
+    return rcl_send_response(service, request_header, rcl_ipc_message_data(message));
+  }
+  rmw_ret_t ret = rcl_ipc_send_owned_response(service->impl->ipc, request_header, message);
+  if (ret != RMW_RET_OK) {
+    RCL_SET_ERROR_MSG(rmw_get_error_string().str);
+    return ret == RMW_RET_TIMEOUT ? RCL_RET_TIMEOUT : RCL_RET_ERROR;
   }
   return RCL_RET_OK;
 }

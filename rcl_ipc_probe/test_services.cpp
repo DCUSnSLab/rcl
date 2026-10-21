@@ -17,6 +17,7 @@
 #include "rcl/rcl.h"
 #include "rcl/graph.h"
 #include "rcl/error_handling.h"
+#include "rcl/intra_process.h"
 #include "test_msgs/srv/basic_types.hpp"
 #include "test_msgs/srv/basic_types.h"
 #include "rosidl_runtime_c/string_functions.h"
@@ -183,5 +184,107 @@ TEST_F(ServiceBroker, CServerAndCppClient)
   EXPECT_EQ("reply", result.string_value);
   test_msgs__srv__BasicTypes_Request__destroy(request);
   test_msgs__srv__BasicTypes_Response__destroy(response);
+}
+TEST_F(ServiceBroker, OwnedRequestAndBorrowedResponse)
+{
+  const void * previous = nullptr;
+  for (int value = 0; value < 3; ++value) {
+    int64_t sequence;
+    send(value, &sequence);
+    ready_service();
+    rmw_service_info_t info{};
+    rcl_ipc_message_t * request_message = nullptr;
+    void * request_data = nullptr;
+    ASSERT_EQ(0, rcl_take_ipc_request(&service, &info, &request_message, &request_data));
+    auto request = static_cast<Service::Request *>(request_data);
+    EXPECT_EQ(value, request->int64_value);
+    EXPECT_EQ(std::string(1024, 'x'), request->string_value);
+    rcl_ipc_message_t * response_message = nullptr;
+    void * response_data = nullptr;
+    ASSERT_EQ(
+      0, rcl_borrow_ipc_response(&service, &info.request_id, &response_message, &response_data));
+    auto response = static_cast<Service::Response *>(response_data);
+    EXPECT_EQ(0, response->int64_value);
+    EXPECT_EQ("", response->string_value);
+    if (previous) {
+      EXPECT_EQ(previous, response_data);
+      EXPECT_GE(response->string_value.capacity(), 4096u);
+    }
+    response->int64_value = value + 10;
+    if (value == 0) {response->string_value = std::string(4096, 'y');}
+    ASSERT_EQ(0, rcl_send_ipc_response(&service, &info.request_id, response_message));
+    rcl_ipc_message_release(response_message);
+    rcl_ipc_message_release(request_message);
+    EXPECT_NE(0, rcl_send_response(&service, &info.request_id, response_data));
+    rcl_reset_error();
+    ready_client();
+    rcl_ipc_message_t * taken = nullptr;
+    void * taken_data = nullptr;
+    ASSERT_EQ(0, rcl_take_ipc_response(&client, &info, &taken, &taken_data));
+    EXPECT_EQ(response_data, taken_data);
+    EXPECT_EQ(sequence, info.request_id.sequence_number);
+    auto result = static_cast<Service::Response *>(taken_data);
+    EXPECT_EQ(value + 10, result->int64_value);
+    EXPECT_EQ(value == 0 ? std::string(4096, 'y') : std::string(), result->string_value);
+    rcl_ipc_message_release(taken);
+    previous = response_data;
+  }
+  rcl_ipc_message_t * message = nullptr;
+  void * data = nullptr;
+  rmw_service_info_t info{};
+  EXPECT_EQ(RCL_RET_SERVICE_TAKE_FAILED, rcl_take_ipc_request(&service, &info, &message, &data));
+  EXPECT_EQ(RCL_RET_CLIENT_TAKE_FAILED, rcl_take_ipc_response(&client, &info, &message, &data));
+}
+TEST_F(ServiceBroker, RetainedRequestIsNotReused)
+{
+  int64_t sequence;
+  send(1, &sequence);
+  ready_service();
+  rmw_service_info_t info{};
+  rcl_ipc_message_t * first = nullptr;
+  void * first_data = nullptr;
+  ASSERT_EQ(0, rcl_take_ipc_request(&service, &info, &first, &first_data));
+  Service::Response response;
+  ASSERT_EQ(0, rcl_send_response(&service, &info.request_id, &response));
+  send(2, &sequence);
+  ready_service();
+  Service::Request second;
+  ASSERT_EQ(0, rcl_take_request_with_info(&service, &info, &second));
+  EXPECT_EQ(2, second.int64_value);
+  EXPECT_EQ(1, static_cast<Service::Request *>(first_data)->int64_value);
+  rcl_ipc_message_release(first);
+}
+TEST_F(ServiceBroker, BorrowNeedsSameLayoutClient)
+{
+  ASSERT_EQ(0, rcl_client_fini(&client, &node));
+  auto options = rcl_client_get_default_options();
+  ASSERT_EQ(0, rcl_client_init(&client, &node,
+      ROSIDL_GET_SRV_TYPE_SUPPORT(test_msgs, srv, BasicTypes), "/broker_service", &options));
+  auto request = test_msgs__srv__BasicTypes_Request__create();
+  request->int64_value = 3;
+  int64_t sequence;
+  ASSERT_EQ(0, rcl_send_request(&client, request, &sequence));
+  test_msgs__srv__BasicTypes_Request__destroy(request);
+  ready_service();
+  rmw_service_info_t info{};
+  rcl_ipc_message_t * message = nullptr;
+  void * data = nullptr;
+  ASSERT_EQ(0, rcl_take_ipc_request(&service, &info, &message, &data));
+  EXPECT_EQ(3, static_cast<Service::Request *>(data)->int64_value);
+  rcl_ipc_message_release(message);
+  rcl_ipc_message_t * borrowed = nullptr;
+  EXPECT_EQ(RCL_RET_UNSUPPORTED,
+      rcl_borrow_ipc_response(&service, &info.request_id, &borrowed, &data));
+  Service::Response response;
+  response.int64_value = 4;
+  ASSERT_EQ(0, rcl_send_response(&service, &info.request_id, &response));
+  EXPECT_EQ(RCL_RET_UNSUPPORTED,
+      rcl_borrow_ipc_response(&service, &info.request_id, &borrowed, &data));
+  ready_client();
+  auto result = test_msgs__srv__BasicTypes_Response__create();
+  rmw_request_id_t id{};
+  ASSERT_EQ(0, rcl_take_response(&client, &id, result));
+  EXPECT_EQ(4, result->int64_value);
+  test_msgs__srv__BasicTypes_Response__destroy(result);
 }
 }  // namespace
