@@ -116,8 +116,8 @@ TEST_F(ServiceBroker, DeferredOutOfOrderAndDuplicateResponses)
     EXPECT_EQ(value, received.int64_value);
     EXPECT_EQ(ids[value].sequence_number, info.request_id.sequence_number);
     EXPECT_GT(info.received_timestamp, 0);
-    EXPECT_NE(0, rcl_send_response(&service, &ids[value], &response));
-    rcl_reset_error();
+    EXPECT_EQ(0, rcl_send_response(&service, &ids[value], &response));
+    EXPECT_EQ(RCL_RET_CLIENT_TAKE_FAILED, rcl_take_response_with_info(&client, &info, &received));
   }
 }
 TEST_F(ServiceBroker, DestroyedClientAndRecreatedService)
@@ -215,8 +215,7 @@ TEST_F(ServiceBroker, OwnedRequestAndBorrowedResponse)
     ASSERT_EQ(0, rcl_send_ipc_response(&service, &info.request_id, response_message));
     rcl_ipc_message_release(response_message);
     rcl_ipc_message_release(request_message);
-    EXPECT_NE(0, rcl_send_response(&service, &info.request_id, response_data));
-    rcl_reset_error();
+    EXPECT_EQ(0, rcl_send_response(&service, &info.request_id, response_data));
     ready_client();
     rcl_ipc_message_t * taken = nullptr;
     void * taken_data = nullptr;

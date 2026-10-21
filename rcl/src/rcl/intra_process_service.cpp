@@ -418,8 +418,7 @@ rcl_ret_t respond(Service & service, rmw_request_id_t * id, void * data, Payload
     std::lock_guard<std::mutex> lock(service.mutex);
     auto route = service.pending.find(key(*id));
     if (route == service.pending.end()) {
-      RMW_SET_ERROR_MSG("request has no pending response route");
-      return RMW_RET_ERROR;
+      return RCL_RET_OK;
     }
     if (route->second.rmw) {
       auto ret = rmw_send_response(service.rmw, id, data);
