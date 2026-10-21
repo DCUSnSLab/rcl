@@ -19,6 +19,7 @@
 #include <thread>
 
 #include "rcl/subscription.h"
+#include "rcl/intra_process.h"
 #include "rcl/rcl.h"
 #include "rmw/rmw.h"
 #include "rmw/validate_full_topic_name.h"
@@ -645,6 +646,8 @@ TEST_F(TestSubscriptionFixture, test_subscription_loaned) {
   rcl_subscription_options_t subscription_options = rcl_subscription_get_default_options();
   ret = rcl_subscription_init(&subscription, this->node_ptr, ts, topic, &subscription_options);
   ASSERT_EQ(RCL_RET_OK, ret) << rcl_get_error_string().str;
+  // Loans come from rmw, which an RCL_INTRA_PROCESS=1 broker subscription does not read.
+  rcl_subscription_disable_ipc(&subscription);
   OSRF_TESTING_TOOLS_CPP_SCOPE_EXIT(
   {
     rcl_ret_t ret = rcl_subscription_fini(&subscription, this->node_ptr);
@@ -762,6 +765,7 @@ TEST_F(TestSubscriptionFixture, test_subscription_loan_disable) {
     rcl_ret_t ret =
       rcl_subscription_init(&subscription, this->node_ptr, ts, topic, &subscription_options);
     ASSERT_EQ(RCL_RET_OK, ret) << rcl_get_error_string().str;
+    rcl_subscription_disable_ipc(&subscription);
     OSRF_TESTING_TOOLS_CPP_SCOPE_EXIT(
     {
       rcl_ret_t ret = rcl_subscription_fini(&subscription, this->node_ptr);
@@ -1542,6 +1546,8 @@ TEST_F(TestSubscriptionFixture, test_subscription_option_ignore_local_publicatio
 /* bad take_serialized
  */
 TEST_F(TestSubscriptionFixtureInit, test_subscription_bad_take_serialized) {
+  // The mocked rmw take is only reached without the RCL_INTRA_PROCESS=1 broker.
+  rcl_subscription_disable_ipc(&subscription);
   rcl_serialized_message_t serialized_msg = rmw_get_zero_initialized_serialized_message();
   size_t initial_serialization_capacity = 0u;
   ASSERT_EQ(

@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 
+#include "rcl/intra_process.h"
 #include "rcl/publisher.h"
 
 #include "rcl/rcl.h"
@@ -707,6 +708,8 @@ TEST_F(TestPublisherFixtureInit, test_mock_assert_wait_for_all_acked)
 
 // Mocking rmw_publish to make rcl_publish fail
 TEST_F(TestPublisherFixtureInit, test_mock_publish) {
+  // The mocked rmw_publish is only reached without the RCL_INTRA_PROCESS=1 broker.
+  rcl_publisher_disable_ipc(&publisher);
   auto mock = mocking_utils::patch_and_return("lib:rcl", rmw_publish, RMW_RET_ERROR);
 
   // Test normal usage of the function rcl_publish returning unexpected RMW_RET_ERROR
