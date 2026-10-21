@@ -21,6 +21,11 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#ifdef __linux__
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <fstream>
+#endif
 
 class Core : public ::testing::Test
 {
@@ -464,3 +469,66 @@ TEST_F(Core, partition_defaults_to_wait_set_order)
   EXPECT_EQ(RCL_RET_OK, rcl_executor_spin(executor, 1, nullptr, nullptr));
   EXPECT_EQ((std::vector<int>{0, 1}), state.sequence);
 }
+
+#ifdef __linux__
+namespace
+{
+int64_t voluntary_switches(pid_t tid)
+{
+  std::ifstream status("/proc/self/task/" + std::to_string(tid) + "/status");
+  std::string line;
+  while (std::getline(status, line)) {
+    if (line.rfind("voluntary_ctxt_switches:", 0) == 0) {return std::stol(line.substr(24));}
+  }
+  return -1;
+}
+}  // namespace
+
+TEST_F(Core, partition_notification_wakes_only_its_group)
+{
+  using namespace std::chrono_literals;
+  struct State
+  {
+    std::mutex mutex;
+    std::unordered_map<uint64_t, pid_t> threads;
+    std::atomic<int> calls{0};
+  } state;
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_set_partitioned(executor, true));
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_set_thread_start(executor,
+    [](size_t, uint64_t group, void * data) {
+      auto & s = *static_cast<State *>(data);
+      std::lock_guard<std::mutex> lock(s.mutex);
+      s.threads[group] = static_cast<pid_t>(syscall(SYS_gettid));
+    }, &state));
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_add_group(executor, 1, RCL_EXECUTOR_MUTUALLY_EXCLUSIVE));
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_add_group(executor, 2, RCL_EXECUTOR_MUTUALLY_EXCLUSIVE));
+  uint64_t busy, idle;
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_add_source(executor,
+    [](void * data) {++static_cast<State *>(data)->calls;}, &state, 1, &busy));
+  ASSERT_EQ(RCL_RET_OK, rcl_executor_add_source(executor, [](void *) {}, nullptr, 2, &idle));
+  std::thread spin([&] {EXPECT_EQ(RCL_RET_OK, rcl_executor_spin(executor, 1, nullptr, nullptr));});
+  for (auto deadline = std::chrono::steady_clock::now() + 2s;
+    std::chrono::steady_clock::now() < deadline; std::this_thread::sleep_for(1ms))
+  {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    if (state.threads.size() == 3) {break;}
+  }
+  std::this_thread::sleep_for(50ms);
+  pid_t idle_thread;
+  {
+    std::lock_guard<std::mutex> lock(state.mutex);
+    ASSERT_EQ(3u, state.threads.size());
+    idle_thread = state.threads.at(2);
+  }
+  const int64_t before = voluntary_switches(idle_thread);
+  const int notifications = 2000;
+  for (int i = 0; i < notifications; ++i) {
+    ASSERT_EQ(RCL_RET_OK, rcl_executor_notify(executor, busy, 1));
+    while (state.calls.load() <= i) {std::this_thread::yield();}
+  }
+  const int64_t woken = voluntary_switches(idle_thread) - before;
+  rcl_executor_stop(handle);
+  spin.join();
+  EXPECT_LT(woken, notifications / 20);
+}
+#endif

@@ -45,57 +45,96 @@ thread_local rcl_executor_t * partition_owner = nullptr;
 thread_local uint64_t partition_group = 0;
 thread_local uint64_t partition_generation = 0;
 thread_local uint32_t partition_heard = 0;
+thread_local size_t partition_lane = 0;
 
 // The middleware reports a sample once, to the callback installed at that time. Credits a removed
 // registration did not consume stay here for the next registration of the same handle.
 std::mutex residual_mutex;
 std::unordered_map<const void *, size_t> residual;
 
+// A futex word and its sleeper count. A ringer that sees no sleeper is seen by the next
+// sleeper's futex compare.
+struct Word
+{
+  alignas(64) std::atomic<uint32_t> value{0};
+  std::atomic<uint32_t> sleepers{0};
+};
+
 struct Control
 {
-  alignas(4) std::atomic<uint32_t> bell{0};
+  // Partition threads sleep on their lane, so a notification wakes only its group's thread.
+  static constexpr size_t kLaneCount = 32;
+  // Flags in the low bits: 1 stop, 2 interrupt.
+  Word bell;
   std::atomic<uint32_t> heard{0};
-  // Pairs with bell: a ringer that sees no sleeper is seen by the next sleeper's futex compare.
-  std::atomic<uint32_t> sleepers{0};
+  std::atomic<bool> partitioned{false};
+  Word lanes[kLaneCount];
 #ifndef __linux__
   std::mutex mutex;
   std::condition_variable condition;
 #endif
 
+  void wake(Word & word, uint32_t add, int threads) noexcept
+  {
+    word.value.fetch_add(add, std::memory_order_seq_cst);
+#ifdef __linux__
+    if (word.sleepers.load(std::memory_order_seq_cst)) {
+      syscall(SYS_futex, &word.value, FUTEX_WAKE_PRIVATE, threads, nullptr, nullptr, 0);
+    }
+#else
+    (void)threads;
+    condition.notify_all();
+#endif
+  }
+
+  // Reaches every waiter, including all partition threads.
   void ring(uint32_t flag = 0, int threads = INT_MAX) noexcept
   {
     int saved = errno;
-    if (flag) {bell.fetch_or(flag, std::memory_order_seq_cst);}
-    bell.fetch_add(4, std::memory_order_seq_cst);
-#ifdef __linux__
-    if (sleepers.load(std::memory_order_seq_cst)) {
-      syscall(SYS_futex, &bell, FUTEX_WAKE_PRIVATE, threads, nullptr, nullptr, 0);
+    if (flag) {bell.value.fetch_or(flag, std::memory_order_seq_cst);}
+    wake(bell, 4, threads);
+    if (partitioned.load(std::memory_order_seq_cst)) {
+      for (auto & lane : lanes) {wake(lane, 1, INT_MAX);}
     }
-#else
-    condition.notify_all();
-#endif
     errno = saved;
   }
 
-  void sleep(uint32_t expected, int64_t ns)
+  // Reaches the shared-mode threads, or only the supervisor in partition mode.
+  void ring_bell(int threads = INT_MAX) noexcept
   {
-    sleepers.fetch_add(1, std::memory_order_seq_cst);
+    int saved = errno;
+    wake(bell, 4, threads);
+    errno = saved;
+  }
+
+  void ring_lanes(uint32_t mask) noexcept
+  {
+    int saved = errno;
+    for (size_t lane = 0; mask; ++lane, mask >>= 1) {
+      if (mask & 1) {wake(lanes[lane], 1, INT_MAX);}
+    }
+    errno = saved;
+  }
+
+  void sleep(Word & word, uint32_t expected, int64_t ns)
+  {
+    word.sleepers.fetch_add(1, std::memory_order_seq_cst);
 #ifdef __linux__
     timespec timeout{};
     if (ns >= 0) {
       timeout.tv_sec = ns / 1000000000;
       timeout.tv_nsec = ns % 1000000000;
     }
-    syscall(SYS_futex, &bell, FUTEX_WAIT_PRIVATE, expected,
+    syscall(SYS_futex, &word.value, FUTEX_WAIT_PRIVATE, expected,
       ns < 0 ? nullptr : &timeout, nullptr, 0);
 #else
     {
       std::unique_lock<std::mutex> lock(mutex);
-      auto changed = [&] {return bell.load(std::memory_order_acquire) != expected;};
+      auto changed = [&] {return word.value.load(std::memory_order_acquire) != expected;};
       if (ns < 0) {condition.wait(lock, changed);} else {condition.wait_for(lock, Ns(ns), changed);}
     }
 #endif
-    sleepers.fetch_sub(1, std::memory_order_relaxed);
+    word.sleepers.fetch_sub(1, std::memory_order_relaxed);
   }
 };
 static_assert(std::atomic<uint32_t>::is_always_lock_free,
@@ -111,6 +150,7 @@ struct Group
   int32_t priority = 0;
   bool enabled = true;
   uint64_t generation = 0;
+  size_t lane = 0;
   std::vector<std::shared_ptr<Entry>> round;
   bool in_round = false;
 };
@@ -120,6 +160,8 @@ struct Clock
   rcl_clock_t * clock;
   Control * control;
   std::atomic<bool> dirty{true};
+  // Lanes of the groups with timers on this clock.
+  std::atomic<uint32_t> lanes{0};
   std::vector<Entry *> heap;
   void exchange(size_t a, size_t b);
   void up(size_t index);
@@ -132,7 +174,16 @@ struct Clock
     if (!before) {
       auto self = static_cast<Clock *>(data);
       self->dirty.store(true, std::memory_order_release);
-      self->control->ring();
+      self->changed();
+    }
+  }
+
+  void changed() noexcept
+  {
+    if (control->partitioned.load(std::memory_order_seq_cst)) {
+      control->ring_lanes(lanes.load(std::memory_order_acquire));
+    } else {
+      control->ring_bell();
     }
   }
 };
@@ -252,6 +303,7 @@ struct rcl_executor_s
   uint64_t sequence = 0;
   uint64_t token_sequence = 0;
   uint64_t clock_sequence = 0;
+  size_t lane_sequence = 0;
   std::atomic<bool> spinning{false};
   bool partitioned = false;
   bool explicit_policy = true;
@@ -259,15 +311,22 @@ struct rcl_executor_s
   rcl_executor_thread_start_fn thread_start = nullptr;
   void * thread_context = nullptr;
 
-  void ring(int threads = INT_MAX)
+  uint32_t lane_bit(uint64_t group) const
   {
-    control->ring(0, partitioned ? INT_MAX : threads);
+    return 1u << groups.at(group).lane;
+  }
+
+  // Wakes the threads that may run a group's work: its partition thread, or shared threads.
+  void wake(uint32_t lanes, int threads)
+  {
+    if (partitioned) {control->ring_lanes(lanes);} else {control->ring_bell(threads);}
   }
 
   static void notification(const void * data, size_t count)
   {
     auto entry = const_cast<Entry *>(static_cast<const Entry *>(data));
     auto self = entry->owner;
+    uint32_t lanes;
     {
       std::lock_guard<std::mutex> lock(self->mutex);
       if (!entry->registered) {
@@ -275,8 +334,9 @@ struct rcl_executor_s
         return;
       }
       self->enqueue(self->entries.at(entry->id), count);
+      lanes = self->lane_bit(entry->group);
     }
-    self->ring(1);
+    self->wake(lanes, 1);
   }
 
   static void keep_residual(const Entry & entry, size_t count)
@@ -300,7 +360,7 @@ struct rcl_executor_s
   {
     auto entry = static_cast<const Entry *>(data);
     entry->clock->dirty.store(true, std::memory_order_release);
-    entry->owner->control->ring();
+    entry->clock->changed();
   }
 
   static rcl_ret_t callback(Entry & e, bool install)
@@ -384,16 +444,31 @@ struct rcl_executor_s
         clock.erase(*entry);
         bool is_ready;
         check(rcl_timer_is_ready(static_cast<const rcl_timer_t *>(entry->entity), &is_ready));
-        if (is_ready) {enqueue(entries.at(entry->id), 1);} else {schedule(*entry);}
+        if (is_ready) {
+          enqueue(entries.at(entry->id), 1);
+          if (partitioned && !(partition_owner == this && entry->group == partition_group)) {
+            control->ring_lanes(lane_bit(entry->group));
+          }
+        } else {
+          schedule(*entry);
+        }
       }
       bool ros = false;
       if (clock.clock->type == RCL_ROS_TIME) {
         check(rcl_is_enabled_ros_time_override(clock.clock, &ros));
       }
-      if (!ros && !clock.heap.empty()) {
-        int64_t remaining = std::max<int64_t>(0, clock.heap.front()->deadline - now);
-        if (delay < 0 || remaining < delay) {delay = remaining;}
+      if (ros || clock.heap.empty()) {continue;}
+      int64_t deadline = clock.heap.front()->deadline;
+      // A partition thread sleeps until its own group's next timer.
+      if (partitioned && partition_owner == this) {
+        deadline = INT64_MAX;
+        for (auto entry : clock.heap) {
+          if (entry->group == partition_group) {deadline = std::min(deadline, entry->deadline);}
+        }
+        if (deadline == INT64_MAX) {continue;}
       }
+      int64_t remaining = std::max<int64_t>(0, deadline - now);
+      if (delay < 0 || remaining < delay) {delay = remaining;}
     }
     return delay;
   }
@@ -494,7 +569,7 @@ struct rcl_executor_s
                if (observer || (wake &&
                group.type == RCL_EXECUTOR_MUTUALLY_EXCLUSIVE && executor->any_eligible()))
                {
-                 executor->ring(1);
+                 executor->wake(executor->lane_bit(entry->group), 1);
                }
     });
   }
@@ -550,6 +625,7 @@ rcl_ret_t rcl_executor_set_partitioned(rcl_executor_t * executor, bool partition
                }
              }
              executor->partitioned = partitioned;
+             executor->control->partitioned.store(partitioned, std::memory_order_seq_cst);
              if (partitioned && !executor->explicit_policy) {
                executor->policy = RCL_EXECUTOR_WAIT_SET;
              }
@@ -564,7 +640,7 @@ rcl_ret_t rcl_executor_remove_group(rcl_executor_t * executor, uint64_t group)
              value.enabled = false;
              value.round.clear();
              value.in_round = false;
-             executor->ring();
+             executor->control->ring();
     });
 }
 
@@ -586,7 +662,7 @@ rcl_ret_t rcl_executor_set_group_priority(
   return boundary([&] {
              std::lock_guard<std::mutex> lock(executor->mutex);
              executor->groups.at(group).priority = priority;
-             executor->ring(1);
+             executor->control->ring(0, 1);
     });
 }
 
@@ -629,7 +705,7 @@ void rcl_executor_interrupt(rcl_executor_handle_t * handle) {handle->control->ri
 void rcl_executor_stop(rcl_executor_handle_t * handle) {handle->control->ring(1);}
 void rcl_executor_reset(rcl_executor_t * executor)
 {
-  executor->control->bell.fetch_and(~uint32_t(3), std::memory_order_acq_rel);
+  executor->control->bell.value.fetch_and(~uint32_t(3), std::memory_order_acq_rel);
   if (executor->policy == RCL_EXECUTOR_WAIT_SET) {
     std::lock_guard<std::mutex> lock(executor->mutex);
     for (auto & pair : executor->groups) {
@@ -651,6 +727,9 @@ rcl_ret_t rcl_executor_add_group(
              }
              auto inserted = executor->groups.emplace(group, Group{type});
              auto & value = inserted.first->second;
+             if (inserted.second) {
+               value.lane = ++executor->lane_sequence % Control::kLaneCount;
+             }
              if (!inserted.second && value.type != type) {
                if (value.enabled) {throw std::invalid_argument("group type cannot change");}
                value.type = type;
@@ -658,9 +737,9 @@ rcl_ret_t rcl_executor_add_group(
              if (!value.enabled) {
                value.enabled = true;
                ++value.generation;
-               executor->ring();
+               executor->control->ring();
              }
-             if (executor->partitioned && inserted.second) {executor->ring();}
+             if (executor->partitioned && inserted.second) {executor->control->ring_bell();}
     });
 }
 
@@ -707,6 +786,7 @@ rcl_ret_t rcl_executor_add(
                    found = executor->clocks.emplace(id, std::move(manager)).first;
                  }
                  entry->clock = found->second.get();
+                 entry->clock->lanes.fetch_or(executor->lane_bit(group), std::memory_order_release);
                }
                executor->entries.emplace(entry->id, entry);
                if (entry->clock) {executor->schedule(*entry);}
@@ -772,13 +852,15 @@ rcl_ret_t rcl_executor_notify(
   rcl_executor_t * executor, rcl_executor_id_t registration, size_t count)
 {
   return boundary([&] {
+             uint32_t lanes;
              {
                std::lock_guard<std::mutex> lock(executor->mutex);
                auto found = executor->entries.find(registration);
                if (found == executor->entries.end()) {return;}
                executor->enqueue(found->second, count);
+               lanes = executor->lane_bit(found->second->group);
              }
-             executor->control->ring();
+             executor->wake(lanes, INT_MAX);
     });
 }
 
@@ -802,7 +884,7 @@ rcl_ret_t rcl_executor_post(
              entry->one_shot = true;
              executor->entries.emplace(entry->id, entry);
              executor->enqueue(entry, 1);
-             executor->control->ring();
+             executor->wake(executor->lane_bit(group), INT_MAX);
     });
 }
 
@@ -810,9 +892,13 @@ static rcl_executor_result_t wait_impl(rcl_executor_t * executor, int64_t timeou
 {
   auto start = Steady::now();
   try {
+    auto & control = *executor->control;
+    const bool lane = executor->partitioned && partition_owner == executor;
+    auto & word = lane ? control.lanes[partition_lane] : control.bell;
     for (;; ) {
-      auto bell = executor->control->bell.load(std::memory_order_acquire);
+      auto bell = control.bell.value.load(std::memory_order_acquire);
       if (bell & 1) {return RCL_EXECUTOR_STOPPED;}
+      auto seen = lane ? word.value.load(std::memory_order_acquire) : bell;
       int64_t delay;
       {
         std::lock_guard<std::mutex> lock(executor->mutex);
@@ -827,10 +913,10 @@ static rcl_executor_result_t wait_impl(rcl_executor_t * executor, int64_t timeou
           return RCL_EXECUTOR_READY;
         }
       }
-      auto heard = executor->partitioned && partition_owner == executor ?
-        std::exchange(partition_heard, bell) :
-        executor->control->heard.exchange(bell, std::memory_order_acq_rel);
-      if (bell != heard) {
+      auto heard = lane ?
+        std::exchange(partition_heard, seen) :
+        control.heard.exchange(bell, std::memory_order_acq_rel);
+      if (seen != heard) {
         return RCL_EXECUTOR_INTERRUPTED;
       }
       if (timeout_ns >= 0) {
@@ -838,7 +924,7 @@ static rcl_executor_result_t wait_impl(rcl_executor_t * executor, int64_t timeou
         if (remaining <= 0) {return RCL_EXECUTOR_TIMEOUT;}
         if (delay < 0 || remaining < delay) {delay = remaining;}
       }
-      executor->control->sleep(bell, delay);
+      control.sleep(word, seen, delay);
     }
   } catch (const std::exception & error) {
     RCL_SET_ERROR_MSG(error.what());
@@ -865,7 +951,9 @@ rcl_executor_result_t rcl_executor_next_excluding(
 {
   try {
     std::lock_guard<std::mutex> lock(executor->mutex);
-    if (executor->control->bell.load(std::memory_order_acquire) & 1) {return RCL_EXECUTOR_STOPPED;}
+    if (executor->control->bell.value.load(std::memory_order_acquire) & 1) {
+      return RCL_EXECUTOR_STOPPED;
+    }
     executor->timers();
     std::shared_ptr<Entry> entry;
     for (;; ) {
@@ -908,8 +996,12 @@ rcl_executor_result_t rcl_executor_next_excluding(
     rcl_executor_trace_claim(executor, item, entry->group, executor->trace_client);
     // Readiness wakes one thread; it passes the wake on while claimable work remains. A thread
     // not yet asleep saw this work under the lock, or sleeps only until its next timer deadline.
-    if (executor->control->sleepers.load(std::memory_order_seq_cst) && executor->any_eligible()) {
-      executor->ring(1);
+    // A partition has one thread, which claims again after this item.
+    if (!executor->partitioned &&
+      executor->control->bell.sleepers.load(std::memory_order_seq_cst) &&
+      executor->any_eligible())
+    {
+      executor->control->ring_bell(1);
     }
     return RCL_EXECUTOR_READY;
   } catch (const std::exception & error) {
@@ -932,12 +1024,13 @@ rcl_ret_t rcl_executor_spin(
   }
   auto result = boundary([&] {
         std::atomic<bool> failed{false};
-        auto run = [&](size_t index, uint64_t group, uint64_t generation) {
+        auto run = [&](size_t index, uint64_t group, uint64_t generation, size_t lane) {
           if (executor->partitioned) {
             partition_owner = executor;
             partition_group = group;
             partition_generation = generation;
-            partition_heard = 0;
+            partition_lane = lane;
+            partition_heard = executor->control->lanes[lane].value.load(std::memory_order_acquire);
           }
           if (executor->thread_start) {
             executor->thread_start(index, group, executor->thread_context);
@@ -971,8 +1064,8 @@ rcl_ret_t rcl_executor_spin(
           std::unordered_map<uint64_t, Worker> workers;
           size_t index = 0;
           try {
-            while (!(executor->control->bell.load(std::memory_order_acquire) & 1)) {
-              auto bell = executor->control->bell.load(std::memory_order_acquire);
+            while (!(executor->control->bell.value.load(std::memory_order_acquire) & 1)) {
+              auto bell = executor->control->bell.value.load(std::memory_order_acquire);
               if (bell & 1) {break;}
               std::vector<std::thread> removed;
               {
@@ -990,12 +1083,13 @@ rcl_ret_t rcl_executor_spin(
                   if (!pair.second.enabled || workers.count(pair.first)) {continue;}
                   auto id = pair.first;
                   auto generation = pair.second.generation;
+                  auto lane = pair.second.lane;
                   auto finished = std::make_shared<std::atomic<bool>>(false);
                   auto thread_index = index++;
-                  std::thread thread([&, finished, thread_index, id, generation] {
-                    run(thread_index, id, generation);
+                  std::thread thread([&, finished, thread_index, id, generation, lane] {
+                    run(thread_index, id, generation, lane);
                     finished->store(true, std::memory_order_release);
-                    executor->ring();
+                    executor->control->ring_bell();
                     });
                   workers.emplace(id, Worker{generation, finished, std::move(thread)});
                 }
@@ -1003,7 +1097,7 @@ rcl_ret_t rcl_executor_spin(
               for (auto & thread : removed) {
                 thread.join();
               }
-              executor->control->sleep(bell, -1);
+              executor->control->sleep(executor->control->bell, bell, -1);
             }
           } catch (...) {
             executor->control->ring(1);
@@ -1021,7 +1115,7 @@ rcl_ret_t rcl_executor_spin(
         std::vector<std::thread> workers;
         try {
           for (size_t i = 1; i < std::max<size_t>(threads, 1); ++i) {
-            workers.emplace_back(run, i, 0, 0);
+            workers.emplace_back(run, i, 0, 0, 0);
           }
         } catch (...) {
           executor->control->ring(1);
@@ -1030,7 +1124,7 @@ rcl_ret_t rcl_executor_spin(
           }
           throw;
         }
-        run(0, 0, 0);
+        run(0, 0, 0, 0);
         for (auto & worker : workers) {
           worker.join();
         }
