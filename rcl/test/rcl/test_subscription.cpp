@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <string>
 #include <thread>
@@ -330,6 +331,71 @@ TEST_F(TestSubscriptionFixture, test_subscription_nominal) {
     EXPECT_EQ(0u, message_info.received_timestamp);
   #endif
   }
+}
+
+TEST_F(TestSubscriptionFixture, test_subscription_user_and_executor_callbacks) {
+  rcl_publisher_t publisher = rcl_get_zero_initialized_publisher();
+  const rosidl_message_type_support_t * ts =
+    ROSIDL_GET_MSG_TYPE_SUPPORT(test_msgs, msg, BasicTypes);
+  constexpr char topic[] = "/chatter_callbacks";
+  rcl_publisher_options_t publisher_options = rcl_publisher_get_default_options();
+  ASSERT_EQ(
+    RCL_RET_OK,
+    rcl_publisher_init(&publisher, this->node_ptr, ts, topic, &publisher_options));
+  OSRF_TESTING_TOOLS_CPP_SCOPE_EXIT(
+  {
+    EXPECT_EQ(RCL_RET_OK, rcl_publisher_fini(&publisher, this->node_ptr));
+  });
+  rcl_subscription_options_t subscription_options = rcl_subscription_get_default_options();
+  rcl_subscription_t subscription = rcl_get_zero_initialized_subscription();
+  ASSERT_EQ(
+    RCL_RET_OK,
+    rcl_subscription_init(&subscription, this->node_ptr, ts, topic, &subscription_options));
+  OSRF_TESTING_TOOLS_CPP_SCOPE_EXIT(
+  {
+    EXPECT_EQ(RCL_RET_OK, rcl_subscription_fini(&subscription, this->node_ptr));
+  });
+  ASSERT_TRUE(wait_for_established_subscription(&publisher, 10, 100));
+
+  std::atomic<size_t> user{0}, executor{0};
+  auto count = [](const void * data, size_t n) {
+      *static_cast<std::atomic<size_t> *>(const_cast<void *>(data)) += n;
+    };
+  auto publish = [&publisher]() {
+      test_msgs__msg__BasicTypes msg;
+      test_msgs__msg__BasicTypes__init(&msg);
+      EXPECT_EQ(RCL_RET_OK, rcl_publish(&publisher, &msg, nullptr));
+      test_msgs__msg__BasicTypes__fini(&msg);
+    };
+  auto reaches = [](const std::atomic<size_t> & value, size_t expected) {
+      for (int i = 0; i < 500 && value < expected; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+      return value >= expected;
+    };
+  ASSERT_EQ(
+    RCL_RET_OK, rcl_subscription_set_on_new_message_callback(&subscription, count, &user));
+  ASSERT_EQ(
+    RCL_RET_OK, rcl_subscription_set_executor_callback(&subscription, count, &executor));
+  publish();
+  EXPECT_TRUE(reaches(user, 1));
+  EXPECT_TRUE(reaches(executor, 1));
+
+  // Clearing the user callback leaves the executor's in place.
+  ASSERT_EQ(
+    RCL_RET_OK, rcl_subscription_set_on_new_message_callback(&subscription, nullptr, nullptr));
+  publish();
+  EXPECT_TRUE(reaches(executor, 2));
+  EXPECT_EQ(1u, user.load());
+
+  // The user callback learns about the message it missed when it is set again.
+  ASSERT_EQ(
+    RCL_RET_OK, rcl_subscription_set_on_new_message_callback(&subscription, count, &user));
+  EXPECT_EQ(2u, user.load());
+  ASSERT_EQ(
+    RCL_RET_OK, rcl_subscription_set_executor_callback(&subscription, nullptr, nullptr));
+  ASSERT_EQ(
+    RCL_RET_OK, rcl_subscription_set_on_new_message_callback(&subscription, nullptr, nullptr));
 }
 
 /* Basic nominal test of a publisher with a string.

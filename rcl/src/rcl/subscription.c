@@ -225,6 +225,7 @@ rcl_subscription_fini(rcl_subscription_t * subscription, rcl_node_t * node)
       result = RCL_RET_ERROR;
     }
 
+    rcl_callback_fanout_fini(subscription->impl->callback_fanout, &allocator);
     allocator.deallocate(subscription->impl, allocator.state);
     subscription->impl = NULL;
   }
@@ -855,9 +856,18 @@ rcl_subscription_can_loan_messages(const rcl_subscription_t * subscription)
   return subscription->impl->rmw_handle->can_loan_messages;
 }
 
-rcl_ret_t
-rcl_subscription_set_on_new_message_callback(
+static rmw_ret_t
+_subscription_install_callback(
+  void * rmw_entity, rmw_event_callback_t callback, const void * user_data)
+{
+  return rmw_subscription_set_on_new_message_callback(
+    (rmw_subscription_t *)rmw_entity, callback, user_data);
+}
+
+static rcl_ret_t
+_subscription_set_callback(
   const rcl_subscription_t * subscription,
+  rcl_callback_fanout_slot_t slot,
   rcl_event_callback_t callback,
   const void * user_data)
 {
@@ -866,10 +876,29 @@ rcl_subscription_set_on_new_message_callback(
     return RCL_RET_INVALID_ARGUMENT;
   }
 
-  return rmw_subscription_set_on_new_message_callback(
-    subscription->impl->rmw_handle,
-    callback,
-    user_data);
+  return rcl_callback_fanout_set(
+    &subscription->impl->callback_fanout, &subscription->impl->options.allocator, slot,
+    callback, user_data,
+    _subscription_install_callback, (void *)subscription->impl->rmw_handle);
+}
+
+rcl_ret_t
+rcl_subscription_set_on_new_message_callback(
+  const rcl_subscription_t * subscription,
+  rcl_event_callback_t callback,
+  const void * user_data)
+{
+  return _subscription_set_callback(subscription, RCL_CALLBACK_FANOUT_USER, callback, user_data);
+}
+
+rcl_ret_t
+rcl_subscription_set_executor_callback(
+  const rcl_subscription_t * subscription,
+  rcl_event_callback_t callback,
+  const void * user_data)
+{
+  return _subscription_set_callback(
+    subscription, RCL_CALLBACK_FANOUT_EXECUTOR, callback, user_data);
 }
 
 #ifdef __cplusplus

@@ -52,6 +52,7 @@ set(${PROJECT_NAME}_sources
   src/rcl/expand_topic_name.c
   src/rcl/graph.c
   src/rcl/guard_condition.c
+  src/rcl/callback_fanout.cpp
   src/rcl/guard_condition_callback.cpp
   src/rcl/intra_process.cpp
   src/rcl/intra_process_service.cpp

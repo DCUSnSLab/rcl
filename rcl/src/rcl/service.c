@@ -37,6 +37,7 @@ extern "C"
 
 #include "rosidl_runtime_c/service_type_support_struct.h"
 
+#include "./callback_fanout.h"
 #include "./common.h"
 #include "./intra_process_service.h"
 #include "./service_event_publisher.h"
@@ -51,6 +52,7 @@ struct rcl_service_impl_s
   rcl_service_event_publisher_t * service_event_publisher;
   char * remapped_service_name;
   rosidl_type_hash_t type_hash;
+  rcl_callback_fanout_t * callback_fanout;
 };
 
 rcl_service_t
@@ -279,6 +281,7 @@ rcl_service_fini(rcl_service_t * service, rcl_node_t * node)
     allocator.deallocate(service->impl->remapped_service_name, allocator.state);
     service->impl->remapped_service_name = NULL;
 
+    rcl_callback_fanout_fini(service->impl->callback_fanout, &allocator);
     allocator.deallocate(service->impl, allocator.state);
     service->impl = NULL;
   }
@@ -525,9 +528,16 @@ rcl_service_response_publisher_get_actual_qos(const rcl_service_t * service)
   return &service->impl->actual_response_publisher_qos;
 }
 
-rcl_ret_t
-rcl_service_set_on_new_request_callback(
+static rmw_ret_t
+_service_install_callback(void * rmw_entity, rmw_event_callback_t callback, const void * user_data)
+{
+  return rmw_service_set_on_new_request_callback((rmw_service_t *)rmw_entity, callback, user_data);
+}
+
+static rcl_ret_t
+_service_set_callback(
   const rcl_service_t * service,
+  rcl_callback_fanout_slot_t slot,
   rcl_event_callback_t callback,
   const void * user_data)
 {
@@ -536,10 +546,27 @@ rcl_service_set_on_new_request_callback(
     return RCL_RET_INVALID_ARGUMENT;
   }
 
-  return rmw_service_set_on_new_request_callback(
-    service->impl->rmw_handle,
-    callback,
-    user_data);
+  return rcl_callback_fanout_set(
+    &service->impl->callback_fanout, &service->impl->options.allocator, slot, callback, user_data,
+    _service_install_callback, (void *)service->impl->rmw_handle);
+}
+
+rcl_ret_t
+rcl_service_set_on_new_request_callback(
+  const rcl_service_t * service,
+  rcl_event_callback_t callback,
+  const void * user_data)
+{
+  return _service_set_callback(service, RCL_CALLBACK_FANOUT_USER, callback, user_data);
+}
+
+rcl_ret_t
+rcl_service_set_executor_callback(
+  const rcl_service_t * service,
+  rcl_event_callback_t callback,
+  const void * user_data)
+{
+  return _service_set_callback(service, RCL_CALLBACK_FANOUT_EXECUTOR, callback, user_data);
 }
 
 rcl_ret_t

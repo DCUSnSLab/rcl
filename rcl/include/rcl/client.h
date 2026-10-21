@@ -499,6 +499,38 @@ rcl_client_set_on_new_response_callback(
   rcl_event_callback_t callback,
   const void * user_data);
 
+/// Set the executor's callback for the client.
+/**
+ * It is called next to the callback set with rcl_client_set_on_new_response_callback().
+ * Both callbacks receive every notification; neither replaces the other.
+ * An executor uses this one, so a callback set by the user keeps working.
+ * After the call returns, a cleared callback is no longer called.
+ * Events that happened while this callback was not set are reported to it when it is set.
+ *
+ * <hr>
+ * Attribute          | Adherence
+ * ------------------ | -------------
+ * Allocates Memory   | Yes, once per client
+ * Thread-Safe        | Yes
+ * Uses Atomics       | No
+ * Lock-Free          | No
+ *
+ * \param[in] client The client on which to set the callback
+ * \param[in] callback The callback to be called when new responses arrive, may be NULL
+ * \param[in] user_data Given to the callback when called later, may be NULL
+ * \return `RCL_RET_OK` if successful, or
+ * \return `RCL_RET_INVALID_ARGUMENT` if `client` is NULL, or
+ * \return `RCL_RET_BAD_ALLOC` if allocating memory fails, or
+ * \return `RCL_RET_UNSUPPORTED` if the API is not implemented in the dds implementation
+ */
+RCL_PUBLIC
+RCL_WARN_UNUSED
+rcl_ret_t
+rcl_client_set_executor_callback(
+  const rcl_client_t * client,
+  rcl_event_callback_t callback,
+  const void * user_data);
+
 /// Configures service introspection features for the client.
 /**
  * Enables or disables service introspection features for this client.

@@ -83,6 +83,7 @@ rcl_publisher_event_init(
 
   event->impl->rmw_handle = rmw_get_zero_initialized_event();
   event->impl->allocator = *allocator;
+  event->impl->callback_fanout = NULL;
 
   rmw_ret_t ret = rmw_publisher_event_init(
     &event->impl->rmw_handle,
@@ -143,6 +144,7 @@ rcl_subscription_event_init(
 
   event->impl->rmw_handle = rmw_get_zero_initialized_event();
   event->impl->allocator = *allocator;
+  event->impl->callback_fanout = NULL;
 
   rmw_ret_t ret = rmw_subscription_event_init(
     &event->impl->rmw_handle,
@@ -198,6 +200,7 @@ rcl_event_fini(rcl_event_t * event)
       RCL_SET_ERROR_MSG(rmw_get_error_string().str);
       result = rcl_convert_rmw_ret_to_rcl_ret(ret);
     }
+    rcl_callback_fanout_fini(event->impl->callback_fanout, &allocator);
     allocator.deallocate(event->impl, allocator.state);
     event->impl = NULL;
   }
@@ -230,9 +233,16 @@ rcl_event_is_valid(const rcl_event_t * event)
   return true;
 }
 
-rcl_ret_t
-rcl_event_set_callback(
+static rmw_ret_t
+_event_install_callback(void * rmw_entity, rmw_event_callback_t callback, const void * user_data)
+{
+  return rmw_event_set_callback((rmw_event_t *)rmw_entity, callback, user_data);
+}
+
+static rcl_ret_t
+_event_set_callback(
   const rcl_event_t * event,
+  rcl_callback_fanout_slot_t slot,
   rcl_event_callback_t callback,
   const void * user_data)
 {
@@ -241,10 +251,27 @@ rcl_event_set_callback(
     return RCL_RET_INVALID_ARGUMENT;
   }
 
-  return rmw_event_set_callback(
-    &event->impl->rmw_handle,
-    callback,
-    user_data);
+  return rcl_callback_fanout_set(
+    &event->impl->callback_fanout, &event->impl->allocator, slot, callback, user_data,
+    _event_install_callback, (void *)&event->impl->rmw_handle);
+}
+
+rcl_ret_t
+rcl_event_set_callback(
+  const rcl_event_t * event,
+  rcl_event_callback_t callback,
+  const void * user_data)
+{
+  return _event_set_callback(event, RCL_CALLBACK_FANOUT_USER, callback, user_data);
+}
+
+rcl_ret_t
+rcl_event_set_executor_callback(
+  const rcl_event_t * event,
+  rcl_event_callback_t callback,
+  const void * user_data)
+{
+  return _event_set_callback(event, RCL_CALLBACK_FANOUT_EXECUTOR, callback, user_data);
 }
 
 #ifdef __cplusplus

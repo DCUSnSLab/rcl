@@ -19,10 +19,13 @@
 
 #include "rcl/event.h"
 
+#include "./callback_fanout.h"
+
 struct rcl_event_impl_s
 {
   rmw_event_t rmw_handle;
   rcl_allocator_t allocator;
+  rcl_callback_fanout_t * callback_fanout;
 };
 
 #endif  // RCL__EVENT_IMPL_H_

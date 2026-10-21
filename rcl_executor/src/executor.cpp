@@ -369,16 +369,17 @@ struct rcl_executor_s
     const void * data = install ? &e : nullptr;
     switch (e.type) {
       case RCL_EXECUTOR_SUBSCRIPTION:
-        return rcl_subscription_set_on_new_message_callback(
+        return rcl_subscription_set_executor_callback(
           static_cast<const rcl_subscription_t *>(e.entity), cb, data);
       case RCL_EXECUTOR_SERVICE:
-        return rcl_service_set_on_new_request_callback(
+        return rcl_service_set_executor_callback(
           static_cast<const rcl_service_t *>(e.entity), cb, data);
       case RCL_EXECUTOR_CLIENT:
-        return rcl_client_set_on_new_response_callback(
+        return rcl_client_set_executor_callback(
           static_cast<const rcl_client_t *>(e.entity), cb, data);
       case RCL_EXECUTOR_EVENT:
-        return rcl_event_set_callback(static_cast<const rcl_event_t *>(e.entity), cb, data);
+        return rcl_event_set_executor_callback(
+          static_cast<const rcl_event_t *>(e.entity), cb, data);
       case RCL_EXECUTOR_GUARD_CONDITION:
         return rcl_guard_condition_set_on_trigger_callback(
           const_cast<rcl_guard_condition_t *>(static_cast<const rcl_guard_condition_t *>(e.entity)),

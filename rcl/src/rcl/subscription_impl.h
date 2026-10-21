@@ -19,6 +19,8 @@
 
 #include "rcl/subscription.h"
 
+#include "./callback_fanout.h"
+
 struct rcl_subscription_impl_s
 {
   void * ipc;
@@ -27,6 +29,7 @@ struct rcl_subscription_impl_s
   rmw_qos_profile_t actual_qos;
   rmw_subscription_t * rmw_handle;
   rosidl_type_hash_t type_hash;
+  rcl_callback_fanout_t * callback_fanout;
 };
 
 #endif  // RCL__SUBSCRIPTION_IMPL_H_
