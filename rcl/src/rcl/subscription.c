@@ -615,13 +615,33 @@ rcl_take_sequence(
   message_info_sequence->size = 0u;
 
   size_t taken = 0u;
-  rmw_ret_t ret = rmw_take_sequence(
-    subscription->impl->rmw_handle, count, message_sequence, message_info_sequence, &taken,
-    allocation);
-  if (ret != RMW_RET_OK) {
-    RCL_SET_ERROR_MSG(rmw_get_error_string().str);
-    return rcl_convert_rmw_ret_to_rcl_ret(ret);
+  if (rcl_subscription_is_ipc_enabled(subscription)) {
+    for (; taken < count; ++taken) {
+      message_info_sequence->data[taken] = rmw_get_zero_initialized_message_info();
+      rcl_ret_t local = rcl_ipc_take_copy(
+        subscription, message_sequence->data[taken], &message_info_sequence->data[taken]);
+      if (RCL_RET_SUBSCRIPTION_TAKE_FAILED == local) {break;}
+      if (RCL_RET_OK != local) {return local;}
+    }
   }
+  if (taken < count) {
+    rmw_message_sequence_t rest = *message_sequence;
+    rest.data += taken;
+    rest.capacity -= taken;
+    rmw_message_info_sequence_t rest_info = *message_info_sequence;
+    rest_info.data += taken;
+    rest_info.capacity -= taken;
+    size_t rest_taken = 0u;
+    rmw_ret_t ret = rmw_take_sequence(
+      subscription->impl->rmw_handle, count - taken, &rest, &rest_info, &rest_taken, allocation);
+    if (ret != RMW_RET_OK) {
+      RCL_SET_ERROR_MSG(rmw_get_error_string().str);
+      return rcl_convert_rmw_ret_to_rcl_ret(ret);
+    }
+    taken += rest_taken;
+  }
+  message_sequence->size = taken;
+  message_info_sequence->size = taken;
   RCUTILS_LOG_DEBUG_NAMED(
     ROS_PACKAGE_NAME, "Subscription took %zu messages", taken);
   if (0u == taken) {
