@@ -78,6 +78,9 @@ typedef void (*rcl_executor_work_fn)(void * context);
 typedef void (*rcl_executor_thread_start_fn)(size_t index, uint64_t group, void * context);
 
 // Configure before spinning. Group zero identifies an unpartitioned or internal worker.
+// Without partitions, index zero is the thread that called rcl_executor_spin(), so attributes
+// the callback sets on it remain after spin returns. Partition mode calls it only on the
+// threads it creates.
 RCL_EXECUTOR_PUBLIC
 rcl_ret_t rcl_executor_set_thread_start(
   rcl_executor_t * executor, rcl_executor_thread_start_fn callback, void * context);
