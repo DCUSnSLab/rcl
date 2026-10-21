@@ -376,6 +376,18 @@ is insufficient when a remote service also exists. A future explicit server-ID
 selection API can make this deterministic. Response failure must not trigger
 request retransmission after a service has already executed it.
 
+Implemented buffer handling: a request is copied once at send into a message of the
+service's type taken from a one-entry pool of the service; a response is copied into
+the client's pool. rclcpp takes both without a copy (`rcl_take_ipc_request`,
+`rcl_take_ipc_response`) and returns the message to its pool when the last
+`shared_ptr` drops, so the buffers stay allocated between calls. A non-deferred
+rclcpp callback fills a response borrowed from the requesting client's pool
+(`rcl_borrow_ipc_response`, reset to default values) that is enqueued without a copy
+when rclcpp holds the only reference and introspection is off. Copying takes (rclpy,
+plain rcl) copy C++ messages and swap the bytes of C messages. Without the pools,
+glibc returned the freed buffers to the kernel after each call and the next call
+faulted every page in again.
+
 Respect service/client QoS histories and request/response byte budgets separately.
 An executor credit represents available request/response data, not completion of a
 future. Actions then benefit through their underlying services plus feedback/status
