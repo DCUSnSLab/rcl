@@ -582,6 +582,7 @@ struct Prepared
   std::vector<Gid> excluded;
   std::vector<std::shared_ptr<Subscription>> notify;
   std::vector<Sample> retired;
+  int64_t source_timestamp = 0;
 };
 thread_local std::shared_ptr<void> publishing_owner;
 struct Adapted
@@ -658,6 +659,7 @@ rmw_ret_t prepare(
     }
     route->excluded_gids = state.excluded.empty() ? nullptr : state.excluded.front().data();
     route->excluded_count = state.excluded.size();
+    state.source_timestamp = info->source_timestamp;
     if (publishing_adapted.fill && publishing_owner.get() == message) {
       // The rmw serializes the message unless every matched reader was routed here.
       bool covered = true;
@@ -920,6 +922,9 @@ rcl_ret_t rcl_ipc_publish(const rcl_publisher_t * publisher, const void * messag
     RCL_SET_ERROR_MSG("allocating transport publication failed");
     ret = RMW_RET_BAD_ALLOC;
   }
+  if (!state.excluded.empty()) {
+    rcl_ipc_trace_publish(publisher, message, state.source_timestamp, state.excluded.size());
+  }
   for (auto & sub : state.notify) {
     std::lock_guard<std::mutex> lock(sub->notify_mutex);
     if (!sub->closed && sub->ready.load()) {sub->api->notify(sub->rmw);}
@@ -949,6 +954,8 @@ rcl_ret_t rcl_take_ipc_message(
     *data = sample.owner->get(*sub->type);
     if (info) {*info = sample.info;}
     result->owner = std::move(sample.owner);
+    rcl_ipc_trace_take(subscription, result.get(), *data, sample.info.source_timestamp,
+      sample.info.from_intra_process);
     *message = result.release();
     return RCL_RET_OK;
   } catch (const ConversionFailure & error) {
@@ -988,6 +995,8 @@ rcl_ret_t rcl_take_ipc_adapted(
     }
     if (info) {*info = sample.info;}
     result->owner = std::move(sample.owner);
+    rcl_ipc_trace_take(subscription, result.get(), *adapted ? *adapted : *data,
+      sample.info.source_timestamp, sample.info.from_intra_process);
     *message = result.release();
     return RCL_RET_OK;
   } catch (const ConversionFailure & error) {
@@ -1014,6 +1023,8 @@ rcl_ret_t rcl_ipc_take_serialized_copy(
     std::shared_ptr<Serialized> bytes;
     auto ret = sample.owner->bytes(bytes);
     if (ret != RCL_RET_OK) {return ret;}
+    rcl_ipc_trace_take(subscription, nullptr, nullptr, sample.info.source_timestamp,
+      sample.info.from_intra_process);
     // Ingress bytes were copied for this publication alone, so the last reader takes the buffer.
     if (sample.owner->encoded_source && sample.owner.use_count() == 1 &&
       same_allocator(output->allocator, bytes->value.allocator))
@@ -1043,7 +1054,11 @@ rcl_ret_t rcl_ipc_take_serialized_copy(
     return RCL_RET_BAD_ALLOC;
   }
 }
-void rcl_ipc_message_release(rcl_ipc_message_t * message) {delete message;}
+void rcl_ipc_message_release(rcl_ipc_message_t * message)
+{
+  rcl_ipc_trace_release(message);
+  delete message;
+}
 rcl_ret_t rcl_ipc_take_copy(
   const rcl_subscription_t * subscription, void * data,
   rmw_message_info_t * info)
@@ -1052,7 +1067,8 @@ rcl_ret_t rcl_ipc_take_copy(
   const void * source;
   auto ret = rcl_take_ipc_message(subscription, &message, &source, info);
   if (ret != RCL_RET_OK) {return ret;}
-  std::unique_ptr<rcl_ipc_message_t> owner(message);
+  std::unique_ptr<rcl_ipc_message_t, void (*)(rcl_ipc_message_t *)> owner(
+    message, rcl_ipc_message_release);
   auto sub = *static_cast<std::shared_ptr<Subscription> *>(subscription->impl->ipc);
   try {
     copy(*sub->type, source, *sub->type, data); return RCL_RET_OK;
@@ -1104,4 +1120,29 @@ rcl_ret_t rcl_publish_ipc_owned(
     RCL_SET_ERROR_MSG("allocating publication owner failed");
     return RCL_RET_BAD_ALLOC;
   }
+}
+
+#if defined(__GNUC__) && !defined(__clang__)
+#define RCL_IPC_TRACE_NOINLINE __attribute__((noinline, noipa))
+#else
+#define RCL_IPC_TRACE_NOINLINE __attribute__((noinline))
+#endif
+int rcl_ipc_trace_contract_1(void) {return 1;}
+RCL_IPC_TRACE_NOINLINE void rcl_ipc_trace_publish(
+  const rcl_publisher_t * publisher, const void * message, int64_t source_timestamp,
+  size_t readers)
+{
+  asm volatile("" : : "g" (publisher), "g" (message) : "memory");
+  asm volatile("" : : "g" (source_timestamp), "g" (readers) : "memory");
+}
+RCL_IPC_TRACE_NOINLINE void rcl_ipc_trace_take(
+  const rcl_subscription_t * subscription, const rcl_ipc_message_t * message, const void * data,
+  int64_t source_timestamp, bool local)
+{
+  asm volatile("" : : "g" (subscription), "g" (message), "g" (data) : "memory");
+  asm volatile("" : : "g" (source_timestamp), "g" (local) : "memory");
+}
+RCL_IPC_TRACE_NOINLINE void rcl_ipc_trace_release(const rcl_ipc_message_t * message)
+{
+  asm volatile("" : : "g" (message) : "memory");
 }

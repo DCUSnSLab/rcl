@@ -65,6 +65,19 @@ RCL_PUBLIC rcl_ret_t rcl_borrow_ipc_response(
 RCL_PUBLIC rcl_ret_t rcl_send_ipc_response(
   const rcl_service_t * service, rmw_request_id_t * request_header,
   rcl_ipc_message_t * message);
+/// Tracing anchors: exported functions that do nothing, for uprobes. Bump the contract symbol
+/// whenever an anchor's arguments change.
+RCL_PUBLIC int rcl_ipc_trace_contract_1(void);
+/// The broker queued message for readers of its own; source_timestamp is their message info's.
+RCL_PUBLIC void rcl_ipc_trace_publish(
+  const rcl_publisher_t * publisher, const void * message, int64_t source_timestamp,
+  size_t readers);
+/// A reader took a broker message: message is retained until rcl_ipc_message_release, NULL when
+/// the take returned a copy. local is false for a remote message that the rmw queued.
+RCL_PUBLIC void rcl_ipc_trace_take(
+  const rcl_subscription_t * subscription, const rcl_ipc_message_t * message, const void * data,
+  int64_t source_timestamp, bool local);
+RCL_PUBLIC void rcl_ipc_trace_release(const rcl_ipc_message_t * message);
 #ifdef __cplusplus
 }
 #endif
