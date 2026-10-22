@@ -1,0 +1,18 @@
+# All settings not listed here will use the Doxygen default values.
+
+PROJECT_NAME           = "rcl_executor"
+PROJECT_NUMBER         = master
+PROJECT_BRIEF          = "C executor core below the ROS client libraries."
+
+INPUT                  = ./include
+RECURSIVE              = YES
+OUTPUT_DIRECTORY       = doc_output
+
+SORT_MEMBER_DOCS       = NO
+
+GENERATE_LATEX         = NO
+
+ENABLE_PREPROCESSING   = YES
+MACRO_EXPANSION        = YES
+EXPAND_ONLY_PREDEF     = YES
+PREDEFINED             += RCL_EXECUTOR_PUBLIC=

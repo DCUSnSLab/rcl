@@ -6,6 +6,8 @@
 // WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the License for the
 // specific language governing permissions and limitations under the License.
 
+/// @file
+
 #ifndef RCL_EXECUTOR__TRACE_H_
 #define RCL_EXECUTOR__TRACE_H_
 
