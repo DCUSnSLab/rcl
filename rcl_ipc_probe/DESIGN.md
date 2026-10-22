@@ -1,7 +1,9 @@
 # Context-scoped intra-process delivery at rcl
 
-Status: design and an intentionally restricted prototype, not a production transport.
-Target: this workspace's Jazzy-based `overhaul` branch. Domain used for all probes: 175.
+Status: design record of the opt-in rcl broker (`RCL_INTRA_PROCESS=1`) on the
+Jazzy-based `overhaul` branch. The broker ships for RMWs that implement the routing
+extension (`rmw_zenoh_cpp`). [Implementation status](#implementation-status) lists
+what the shipped broker covers and where it is narrower than this design.
 
 ## Decision and scope
 
@@ -22,15 +24,15 @@ It is additive and feature-negotiated. Without it, preserve the existing RMW pat
 for pairs for which exactly-once hybrid routing cannot be established. Do not ship
 an optimistic graph-count heuristic as a correctness mechanism.
 
-The implemented experiment validates a smaller question: can a generated C message
-cross a C++/Python boundary without serialization, retain its correct ownership, and
-wake the common executor? It deliberately does not implement transparent routing.
+The first prototype (`rcl/ipc_prototype.h`) answered a smaller question: can a
+generated C message cross a C++/Python boundary without serialization, retain its
+correct ownership, and wake the common executor? It deliberately did not implement
+transparent routing.
 
 ## Evidence and prior work
 
-The complete issue bodies, discussion comments, relevant review comments and PR
-patches are archived in [research](/tmp/claude-1000/-home-nev-flux-devel/2098f1b0-2fbe-4a6c-b7c7-9521268b2bb3/scratchpad/codex/wp4/research/). Retrieved with `gh api`, including
-paginated comments and PR files. These are historical proposals, not merged APIs.
+The design read the issue bodies, discussion and review comments and PR patches
+below. These are historical proposals, not merged APIs.
 
 | Source | Consequence for this design |
 | --- | --- |
@@ -65,13 +67,13 @@ paginated comments and PR files. These are historical proposals, not merged APIs
   credits, `next` claims a callback group, and `complete` releases that claim.
   Removal cancels queued work; already claimed work must finish. The source API is
   sufficient for the prototype. No new waker thread or DDS notification topic is needed.
-* Parked shared-memory design, section 3:
-  flat frames, segment epochs, flux ownership and executor notifications are useful
+* An earlier shared-memory lane in rcl, since removed from this fork: flat frames,
+  segment epochs, external ownership and executor notifications are useful
   experience, but this IPC design uses ordinary pointers inside a process. Do not
   revive its single-writer restriction, node-name endpoint matching, count-based
-  route decisions, timestamp merge or one-second ordering escape hatch. That record
-  documents Cyclone publisher-GID/received-handle mismatch and an actual order
-  inversion at route changes. Both are reasons to require a routing protocol.
+  route decisions, timestamp merge or one-second ordering escape hatch. The lane hit
+  a Cyclone publisher-GID/received-handle mismatch and an actual order inversion at
+  route changes. Both are reasons to require a routing protocol.
 
 ## Representations and conversion
 
@@ -203,8 +205,8 @@ This is more than the count API proposed by rmw#358. A provider may implement it
 with a writer routing lock and local reader filters. The broker callback invoked
 under that protocol must only commit prepared queue state, with a documented lock
 order; it cannot allocate, run language code, or reenter RMW. Notify executors after
-leaving routing locks. This protocol and its backend feasibility are production
-gates; the present experiment does not validate them.
+leaving routing locks. The shipped extension implements a narrower form of this
+protocol; see [Implementation status](#implementation-status).
 
 A fixed IPC binding remains active across a remote reader joining: remote samples
 go through RMW, local samples keep the IPC route. No global topic mode flip.
@@ -346,8 +348,9 @@ shutdown authority, and prevent either wrapper from finalizing a borrowed contex
 Initialize the interpreter/GIL before loading Python components and join their work
 before interpreter finalization. Matching ROS_DOMAIN_ID or loading Python in a
 C++ process does not automatically share a context. rclpy#599 alone provides no
-such contract. The prototype embeds a Python consumer of a native rcl context;
-it does not claim to supply a mixed rclcpp/rclpy component container.
+such contract. rclpy's `Context.init(context_lease=...)` takes such a lease, and
+`rclpy_components`' `component_container_mixed` uses it to run rclcpp components and
+rclpy nodes in one context.
 
 ## Services, clients and actions
 
@@ -423,11 +426,11 @@ this distinction must be explicit in copy accounting for generic callbacks.
 
 No existing public rcl publisher/subscription/context/options struct grows. Store
 broker state in `rcl_context_impl_t` and endpoint registration pointers in private
-publisher/subscription/service/client implementations. The prototype adds only a
-context pointer to the private subscription impl and an opaque queue API; it does
-not change ordinary publish/take behavior. New public options use a versioned
-size-tagged separate configuration API after endpoint initialization, before
-activation. New owners and route tokens are opaque handles.
+implementations. The shipped broker adds pointers to the private context, publisher
+and subscription impls and keeps service and client state in the context's service
+broker. New public options use a versioned size-tagged separate configuration API
+after endpoint initialization, before activation. New owners and route tokens are
+opaque handles.
 
 No removed exported symbols or changed signatures. Keep existing C++ class layouts,
 vtable slots and template interoperability; use private impls/sidecars for the
@@ -441,26 +444,50 @@ only when every needed policy/capability is present. Emit a debug reason when a
 pair falls back. Keep counters for admissions, drops, conversions, duplicate
 suppression, retained bytes and fallback reasons.
 
-## Prototype and results
+## Implementation status
 
-See [prototype instructions](README.md) and [measured results](REPORT.md).
-Source is in the wp4 rcl worktree: `rcl/include/rcl/ipc_prototype.h`,
-`rcl/src/rcl/ipc_prototype.cpp` and the `rcl_ipc_probe` package.
+The broker is enabled per context when `RCL_INTRA_PROCESS=1` is set at context
+initialization and the RMW library exports `rmw_get_intra_process_api_v1`
+(`rmw/intra_process.h`, version 1). Services use `rmw/intra_process_service.h` and
+serialized ingress `rmw/intra_process_serialized.h`. Otherwise every endpoint uses
+the ordinary RMW path. Public API: `rcl/intra_process.h`. Sources:
+`rcl/src/rcl/intra_process.cpp` and `rcl/src/rcl/intra_process_service.cpp`.
 
-The explicit single-pair API checks same context, topic and nonzero type hash,
-and requires KEEP_LAST(1), volatile, reliable endpoints. Both sides promise the
+Covered:
+
+* Topics with KEEP_LAST (depth > 0), VOLATILE, RELIABLE or BEST_EFFORT, no deadline,
+  lifespan or liveliness lease, and liveliness other than MANUAL_BY_TOPIC. Endpoints
+  outside this set, subscriptions with a content filter and subscriptions with
+  `ignore_local_publications` stay on RMW for their lifetime.
+* Duplicate suppression by reader GID. The RMW publish calls back into the broker,
+  which admits the publication to its same-context readers and returns their GIDs.
+  The RMW attaches that list to the publication and a listed reader drops it before
+  deserializing. When every matched reader is covered, nothing is serialized.
+  Remote samples enter the same reader queue through the ingress callback, so one
+  KEEP_LAST depth bounds both routes.
+* Representations: generated C and C++ messages with conversion on first take,
+  owned publication (`rcl_publish_ipc_owned`), adapted objects shared by key with a
+  lazy fill for ROS readers (`rcl_publish_ipc_adapted`), and one lazy serialization
+  shared by generic and serialized readers (`rcl_subscription_set_serialized_ipc`).
+* Services and actions: requests and responses through per-endpoint pools, with the
+  response route pinned to the request (see the buffer handling paragraph above).
+* Readiness through `rcl_executor` sources and classic `rcl_wait`.
+* rclcpp and rclpy endpoints join by default. rclcpp endpoints that select the
+  legacy intra-process manager or `IntraProcessSetting::Disable` call
+  `rcl_publisher_disable_ipc` or `rcl_subscription_disable_ipc`.
+
+Not covered: KEEP_ALL, transient local replay, deadline, lifespan and liveliness
+accounting, route epochs and sequence fences for a binding that changes route, and
+providers other than `rmw_zenoh_cpp`. Such pairs stay on RMW, as the reachability
+table requires.
+
+The first prototype, `rcl/ipc_prototype.h` with `probe.cpp`, `bench.py` and
+`test_ipc.cpp` in the `rcl_ipc_probe` package, remains for reference. It is an
+explicit single-pair API with KEEP_LAST(1), volatile, reliable endpoints and the
 generated C representation. It transfers one owned message, releases an unread
-replacement, and notifies on empty-to-nonempty outside its lock. A Python ctypes
-consumer waits via the existing common executor, takes the pointer and invokes the
-existing generated `sensor_msgs` C-to-Python converter with its GIL held.
-
-The restriction is deliberate: rcl's opaque pointer carries no C/C++ representation
-identity today. The experiment supplies that contract explicitly instead of
-pretending that any `rcl_publish(void *)` can be intercepted safely. It validates
-one C-owner handoff and one Python conversion; it does not validate C++ struct
-conversion, shared-owner fanout, RMW suppression, remote reachability, automatic
-hooks, service selection, legacy waitsets or a real rclpy Node wrapper. It is an
-experimental additive API, not a production ABI commitment.
+replacement, and notifies on empty-to-nonempty outside its lock. It removed the
+serialization copies of the RMW route; the generated Python converter still made
+one copy. New code uses `rcl/intra_process.h`.
 
 ## Test plan and production gates
 
@@ -475,9 +502,8 @@ experimental additive API, not a production ABI commitment.
 | Executor | Publish before wait, publish during sleep, overwrite while ready, take/disarm/publish race, multi-thread claims, group exclusion/priorities, coroutine completion, remove while callback claimed, callback reentrancy, shutdown, legacy wait-set and event executor parity. |
 | Services | Multiple clients, deferred and out-of-order responses, cancellation/timeouts, service removal/recreation, local plus remote services, remote client to local server, request executed once despite errors; actions parameter services as integration cases. |
 | ABI | `nm -D --defined-only` before/after, sizeof/alignof/offsetof existing public handles/options and representative C++ classes, run old compiled baseline against new rcl; add only new symbols. |
-| Performance | Reproduce unmodified path first; alternate frozen baseline/prototype runs, same environment and payload checks, libmemcount reset after warmup, end-to-end and native-hop timing separately, load <2 at start/end, payload sizes, fanout/mixed readers, allocations and retained bytes. |
+| Performance | Reproduce unmodified path first; alternate baseline and changed builds, same environment and payload checks, copy counters reset after warmup, end-to-end and native-hop timing separately, timing on CPU cores reserved for measurement, payload sizes, fanout/mixed readers, allocations and retained bytes. |
 
-The current tests cover only the implemented slice. Production acceptance requires
-all relevant rows above and at least two RMW providers, including an identity model
-unlike Fast DDS. The routing extension, direct C++/C adapter coverage and ABI-safe
-language facade migration are the largest remaining engineering tasks.
+`test_broker.cpp` and `test_services.cpp` in `rcl_ipc_probe` cover the implemented
+slice. Wider acceptance requires the remaining rows above and a second RMW provider
+of the routing extension.
